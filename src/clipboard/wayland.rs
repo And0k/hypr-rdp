@@ -18,8 +18,8 @@ use wayland_protocols_wlr::data_control::v1::client::{
 use super::backend::{announce_local_formats, ClipboardEchoCandidate};
 use super::files::{uri_list_paths, FileSelection};
 use super::formats::{
-    PendingWrite, SelectionKind, FILE_URI_LIST_MIME, GNOME_COPIED_FILES_MIME, IMAGE_PNG_MIME,
-    MAX_CLIPBOARD_SIZE, TEXT_MIME, TEXT_PLAIN_MIME, UTF8_MIME,
+    latin1_to_utf8, PendingWrite, SelectionKind, FILE_URI_LIST_MIME, GNOME_COPIED_FILES_MIME,
+    IMAGE_PNG_MIME, LATIN1_STRING_MIME, MAX_CLIPBOARD_SIZE, TEXT_MIME, TEXT_PLAIN_MIME, UTF8_MIME,
 };
 use super::inbound::InboundHandle;
 
@@ -392,6 +392,11 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
 
                 if let Some(ref mime) = text_mime {
                     if let Some(data) = read_offer_data(&offer, mime, conn) {
+                        let data = if mime == LATIN1_STRING_MIME {
+                            latin1_to_utf8(&data)
+                        } else {
+                            data
+                        };
                         if !data.is_empty() {
                             tracing::trace!(len = data.len(), "Clipboard: read text data");
                             if let Ok(mut g) = state.clipboard_data.lock() {

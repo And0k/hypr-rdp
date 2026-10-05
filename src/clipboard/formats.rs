@@ -3,6 +3,9 @@ pub(super) const MAX_CLIPBOARD_SIZE: usize = 100 * 1024 * 1024;
 pub(super) const TEXT_MIME: &str = "text/plain;charset=utf-8";
 pub(super) const UTF8_MIME: &str = "UTF8_STRING";
 pub(super) const TEXT_PLAIN_MIME: &str = "text/plain";
+/// ICCCM `STRING` (ISO-8859-1). Older X11 toolkits (Motif, Xt) offer copied text only
+/// under this target, which Xwayland passes on to the Wayland selection unchanged.
+pub(super) const LATIN1_STRING_MIME: &str = "STRING";
 pub(super) const IMAGE_PNG_MIME: &str = "image/png";
 pub(super) const FILE_URI_LIST_MIME: &str = "text/uri-list";
 pub(super) const GNOME_COPIED_FILES_MIME: &str = "x-special/gnome-copied-files";
@@ -37,6 +40,13 @@ impl SelectionKind {
         mimes
             .iter()
             .find(|mime| self.accepts_wayland_mime(mime))
+            .or_else(|| {
+                // Text only offered as Latin-1 STRING (e.g. Motif apps under Xwayland):
+                // read it as a fallback when no UTF-8 text target is offered.
+                (self == Self::Text)
+                    .then(|| mimes.iter().find(|mime| *mime == LATIN1_STRING_MIME))
+                    .flatten()
+            })
             .cloned()
     }
 }
@@ -168,8 +178,45 @@ pub(super) fn utf16le_to_utf8(data: &[u8]) -> String {
     String::from_utf16_lossy(&u16s[..end])
 }
 
+/// Convert ICCCM `STRING` (ISO-8859-1) bytes to UTF-8: each byte is the code point of
+/// the same value.
+pub(super) fn latin1_to_utf8(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .iter()
+        .map(|&b| char::from(b))
+        .collect::<String>()
+        .into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn latin1_string_is_a_text_fallback_only() {
+        let only_string = vec!["TARGETS".to_string(), "STRING".to_string()];
+        assert_eq!(
+            SelectionKind::Text
+                .offered_wayland_mime(&only_string)
+                .as_deref(),
+            Some(LATIN1_STRING_MIME)
+        );
+        let both = vec!["STRING".to_string(), "UTF8_STRING".to_string()];
+        assert_eq!(
+            SelectionKind::Text.offered_wayland_mime(&both).as_deref(),
+            Some(UTF8_MIME)
+        );
+        assert_eq!(
+            SelectionKind::Image.offered_wayland_mime(&only_string),
+            None
+        );
+        assert!(!SelectionKind::Text.accepts_wayland_mime(LATIN1_STRING_MIME));
+    }
+
+    #[test]
+    fn latin1_converts_to_utf8() {
+        assert_eq!(latin1_to_utf8(b"Gr\xfc\xdfe \xe4"), "Grüße ä".as_bytes());
+        assert_eq!(latin1_to_utf8(b"plain"), b"plain");
+    }
+
     use super::*;
     use proptest::prelude::*;
 
