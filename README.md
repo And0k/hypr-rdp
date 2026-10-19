@@ -122,7 +122,7 @@ Run `hypr-rdp --help` for all options.
 | `--auth-mode` | `configured` credentials or Linux `pam` | `configured` |
 | `--pam-service` | PAM service name | `hypr-rdp` |
 | `--capture-mode` | `wlr` or `ext` capture protocol | `wlr` |
-| `--egfx-codec` | `avc420`, experimental `avc444`, or `auto` | `avc420` |
+| `--egfx-codec` | `avc420`, experimental `avc444`, `auto`, or `clearcodec` (lossless, damage-only ClearCodec instead of H.264 for EGFX clients) | `avc420` |
 | `--h264-backend` | `auto`, `software`, or `vaapi` | `auto` |
 | `--bitrate` | Video bitrate in bits/s | `10000000` |
 | `--quality` | H.264 quality, 0–51 (lower is better) | `23` |
