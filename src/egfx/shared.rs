@@ -15,6 +15,15 @@ pub enum EgfxCodecPolicy {
     Auto,
     Avc420,
     Avc444,
+    /// Select sparse ClearCodec frames even when the client supports AVC.
+    ClearCodec,
+}
+
+impl EgfxCodecPolicy {
+    /// Whether this policy permits sending AVC (H.264) frames.
+    pub(crate) fn allows_avc(self) -> bool {
+        !matches!(self, Self::ClearCodec)
+    }
 }
 
 pub(in crate::egfx) fn avc444_disabled_by_env() -> bool {
@@ -75,9 +84,9 @@ pub struct EgfxShared {
     pub(in crate::egfx) handle: Mutex<Option<GfxServerHandle>>,
     /// Whether EGFX capability negotiation is complete
     pub(in crate::egfx) ready: AtomicBool,
-    /// Whether the negotiated capability supports AVC420/AVC444 (H.264)
+    /// Whether the negotiated capability and server policy enable AVC420/AVC444.
     pub(in crate::egfx) avc_enabled: AtomicBool,
-    /// Whether the negotiated capability supports AVC444.
+    /// Whether the negotiated capability and server policy enable AVC444.
     pub(in crate::egfx) avc444_enabled: AtomicBool,
     /// Incremented each time on_ready fires; lets capture thread detect re-negotiation
     pub(in crate::egfx) ready_generation: AtomicU32,
@@ -170,7 +179,7 @@ impl EgfxShared {
         self.max_frames_in_flight.load(Ordering::Acquire).max(1)
     }
 
-    pub(in crate::egfx) fn codec_policy(&self) -> EgfxCodecPolicy {
+    pub(crate) fn codec_policy(&self) -> EgfxCodecPolicy {
         self.codec_policy
     }
 
