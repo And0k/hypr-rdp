@@ -74,6 +74,8 @@ url = "2"
 fuser = { version = "0.18", default-features = false, optional = true }
 
 [dev-dependencies]
+wayland-server = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["server"] }
 ironrdp-connector = { git = "https://github.com/Devolutions/IronRDP.git", rev = "458545e6d5c5963a3673e7f686c0bdee3848b58b" }
 ironrdp-tokio = { git = "https://github.com/Devolutions/IronRDP.git", rev = "458545e6d5c5963a3673e7f686c0bdee3848b58b" }
 png = "0.18.1"
