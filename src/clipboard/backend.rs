@@ -1582,6 +1582,130 @@ mod tests {
     }
 
     #[test]
+    fn string_offer_reaches_unicode_response() {
+        use super::super::formats::{LATIN1_STRING_MIME, UTF8_MIME};
+
+        let (mut backend, mut events) = backend_with_events();
+        let mut wayland = text_offer_harness(&backend);
+        for (offers, selected, expected) in [
+            (
+                vec![(LATIN1_STRING_MIME, b"Gr\xfc\xdfe\t\xe4\nfin".as_slice())],
+                LATIN1_STRING_MIME,
+                "Grüße\tä\r\nfin",
+            ),
+            (
+                vec![
+                    (LATIN1_STRING_MIME, b"wrong".as_slice()),
+                    (UTF8_MIME, "四😀\n".as_bytes()),
+                ],
+                UTF8_MIME,
+                "四😀\r\n",
+            ),
+            (
+                vec![(LATIN1_STRING_MIME, b"\xc3\xa9".as_slice())],
+                LATIN1_STRING_MIME,
+                "Ã©",
+            ),
+        ] {
+            assert_eq!(wayland.publish(&offers), vec![selected]);
+            let ClipboardMessage::SendInitiateCopy(formats) = recv_clipboard_event(&mut events)
+            else {
+                panic!("Wayland text must announce a format");
+            };
+            assert_eq!(formats.len(), 1);
+            assert_eq!(formats[0].id, ClipboardFormatId::CF_UNICODETEXT);
+            backend.on_format_data_request(FormatDataRequest {
+                format: ClipboardFormatId::CF_UNICODETEXT,
+            });
+            let ClipboardMessage::SendFormatData(response) = recv_clipboard_event(&mut events)
+            else {
+                panic!("expected Unicode response");
+            };
+            assert!(!response.is_error());
+            assert_eq!(response.data(), utf16le(expected));
+
+            // An echoed Windows representation must compare against the converted local snapshot.
+            backend.on_remote_copy(&formats);
+            assert!(matches!(
+                recv_clipboard_event(&mut events),
+                ClipboardMessage::SendInitiatePaste(ClipboardFormatId::CF_UNICODETEXT)
+            ));
+            backend.on_format_data_response(response);
+            assert!(backend.pending_write.lock().unwrap().is_none());
+            assert!(events.try_recv().is_err());
+        }
+    }
+
+    fn text_offer_harness(
+        backend: &HyprCliprdrBackend,
+    ) -> super::super::wayland::selection_tests::TextOfferHarness {
+        super::super::wayland::selection_tests::TextOfferHarness::new(ClipboardShared {
+            event_sender: backend.event_sender.as_ref().unwrap().clone(),
+            clipboard_data: Arc::clone(&backend.clipboard_data),
+            clipboard_image: Arc::clone(&backend.clipboard_image),
+            pending_write: Arc::clone(&backend.pending_write),
+            echo_candidate: Arc::clone(&backend.echo_candidate),
+            file_selection: FileSelection::new(Arc::clone(&backend.files), None),
+            inbound: None,
+        })
+    }
+
+    #[test]
+    fn string_offer_failure_clears_stale_text_and_next_copy_recovers() {
+        use super::super::formats::LATIN1_STRING_MIME;
+
+        let (mut backend, mut events) = backend_with_events();
+        let mut wayland = text_offer_harness(&backend);
+        for stalled in [false, true] {
+            assert_eq!(
+                wayland.publish(&[(LATIN1_STRING_MIME, b"previous")]),
+                vec![LATIN1_STRING_MIME]
+            );
+            let _ = recv_clipboard_event(&mut events);
+            if stalled {
+                assert_eq!(
+                    wayland.publish_stalled(LATIN1_STRING_MIME),
+                    vec![LATIN1_STRING_MIME]
+                );
+            } else {
+                assert_eq!(
+                    wayland.publish(&[(LATIN1_STRING_MIME, b"")]),
+                    vec![LATIN1_STRING_MIME]
+                );
+            }
+            assert!(
+                events.try_recv().is_err(),
+                "failed text must not be announced"
+            );
+            assert!(backend.clipboard_data.lock().unwrap().is_none());
+            assert!(backend.echo_candidate.lock().unwrap().is_none());
+            backend.on_format_data_request(FormatDataRequest {
+                format: ClipboardFormatId::CF_UNICODETEXT,
+            });
+            let ClipboardMessage::SendFormatData(response) = recv_clipboard_event(&mut events)
+            else {
+                panic!("expected failure response");
+            };
+            assert!(response.is_error(), "must not serve stale bytes");
+        }
+        wayland.publish(&[(LATIN1_STRING_MIME, b"caf\xe9")]);
+        let _ = recv_clipboard_event(&mut events);
+        backend.on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_UNICODETEXT,
+        });
+        let ClipboardMessage::SendFormatData(response) = recv_clipboard_event(&mut events) else {
+            panic!("expected recovered response");
+        };
+        assert_eq!(response.data(), utf16le("café"));
+
+        assert!(wayland
+            .publish(&[("COMPOUND_TEXT", b"unhandled")])
+            .is_empty());
+        assert!(backend.clipboard_data.lock().unwrap().is_none());
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
     fn unicode_text_response_ends_every_line_with_crlf() {
         let (mut backend, mut event_rx) = backend_with_events();
         *backend.clipboard_data.lock().unwrap() = Some("\none\rtwo\r\n四".as_bytes().to_vec());
