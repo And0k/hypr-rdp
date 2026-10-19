@@ -137,7 +137,7 @@ struct Args {
     max_frames_in_flight: Option<u32>,
 
     /// EGFX codec policy: "avc420" (default), "avc444" (experimental), "auto", or
-    /// "clearcodec" (never negotiate AVC: lossless, damage-only ClearCodec frames)
+    /// "clearcodec" (send lossless, damage-only ClearCodec frames instead of H.264)
     #[arg(long)]
     egfx_codec: Option<String>,
 
@@ -935,6 +935,27 @@ mod tests {
     }
 
     #[test]
+    fn clearcodec_policy_resolves_from_toml_and_cli() {
+        let config: ConfigFile = toml::from_str("egfx_codec = 'clearcodec'").unwrap();
+        assert_eq!(
+            resolve_egfx_codec_policy(None, config.egfx_codec).unwrap(),
+            EgfxCodecPolicy::ClearCodec
+        );
+        let args = Args::try_parse_from(["hypr-rdp", "--egfx-codec", "clearcodec"]).unwrap();
+        assert_eq!(
+            resolve_egfx_codec_policy(args.egfx_codec, Some("avc444".into())).unwrap(),
+            EgfxCodecPolicy::ClearCodec
+        );
+        let args = Args::try_parse_from(["hypr-rdp", "--egfx-codec", "avc420"]).unwrap();
+        assert_eq!(
+            resolve_egfx_codec_policy(args.egfx_codec, Some("clearcodec".into())).unwrap(),
+            EgfxCodecPolicy::Avc420
+        );
+        let args = Args::try_parse_from(["hypr-rdp", "--egfx-codec", "clearcodec-typo"]).unwrap();
+        assert!(resolve_egfx_codec_policy(args.egfx_codec, Some("clearcodec".into())).is_err());
+    }
+
+    #[test]
     fn parses_egfx_codec_policy_values() {
         assert_eq!(
             parse_egfx_codec_policy("auto").unwrap(),
@@ -1323,10 +1344,10 @@ mod tests {
 
         #[test]
         fn generated_policy_parsers_accept_only_documented_exact_tokens(
-            token in "[a-z0-9_-]{0,16}"
+            token in prop_oneof![Just("clearcodec".to_owned()), "[a-z0-9_-]{0,16}"]
         ) {
             match token.as_str() {
-                "auto" | "avc420" | "avc444" => {
+                "auto" | "avc420" | "avc444" | "clearcodec" => {
                     prop_assert!(parse_egfx_codec_policy(&token).is_ok());
                 }
                 _ => {

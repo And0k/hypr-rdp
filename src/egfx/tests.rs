@@ -1237,31 +1237,154 @@ fn auto_policy_uses_v10_avc444_when_v81_lacks_avc420_flag() {
 }
 
 #[test]
-fn only_the_clearcodec_policy_rules_out_avc() {
-    assert!(EgfxCodecPolicy::Auto.allows_avc());
-    assert!(EgfxCodecPolicy::Avc420.allows_avc());
-    assert!(EgfxCodecPolicy::Avc444.allows_avc());
-    assert!(!EgfxCodecPolicy::ClearCodec.allows_avc());
+fn clearcodec_policy_preserves_capability_ladder() {
+    use ironrdp_egfx::pdu::*;
+
+    for (client, expected) in [
+        (
+            CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::empty(),
+            },
+            CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::empty(),
+            },
+        ),
+        (
+            CapabilitySet::V8_1 {
+                flags: CapabilitiesV81Flags::AVC420_ENABLED,
+            },
+            CapabilitySet::V8_1 {
+                flags: CapabilitiesV81Flags::empty(),
+            },
+        ),
+        (
+            CapabilitySet::V10 {
+                flags: CapabilitiesV10Flags::empty(),
+            },
+            CapabilitySet::V10 {
+                flags: CapabilitiesV10Flags::empty(),
+            },
+        ),
+        (
+            CapabilitySet::V10 {
+                flags: CapabilitiesV10Flags::AVC_DISABLED,
+            },
+            CapabilitySet::V10 {
+                flags: CapabilitiesV10Flags::AVC_DISABLED,
+            },
+        ),
+        (
+            CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::empty(),
+            },
+            CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::empty(),
+            },
+        ),
+        (
+            CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::AVC_DISABLED,
+            },
+            CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::AVC_DISABLED,
+            },
+        ),
+    ] {
+        let mut session = unnegotiated_egfx_session(16, 16, EgfxCodecPolicy::ClearCodec);
+        session.bridge.start(TEST_CHANNEL_ID).unwrap();
+        let caps = GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(
+            std::slice::from_ref(&client),
+        ));
+        let output = session
+            .bridge
+            .process(TEST_CHANNEL_ID, &encode_vec(&caps).unwrap())
+            .unwrap();
+        let confirmed: Vec<_> = output
+            .iter()
+            .filter_map(|message| match decode_gfx_output(message) {
+                GfxPdu::CapabilitiesConfirm(confirm) => Some(confirm.0.parsed().unwrap().unwrap()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(confirmed, vec![expected], "client: {client:?}");
+        assert!(session.shared.is_ready());
+        assert!(!session.shared.is_avc_enabled());
+        assert!(!session.shared.is_avc444_enabled());
+    }
 }
 
 #[test]
-fn clearcodec_policy_never_negotiates_avc() {
+fn clearcodec_policy_selects_no_avc_for_all_capability_versions() {
     use ironrdp_egfx::pdu::*;
 
-    // A client offering AVC420 and AVC444 still gets no AVC under the ClearCodec policy.
+    // This is local send policy; negotiated client AVC support may remain enabled.
     for cap in [
+        CapabilitySet::V8 {
+            flags: CapabilitiesV8Flags::empty(),
+        },
         CapabilitySet::V8_1 {
             flags: CapabilitiesV81Flags::AVC420_ENABLED,
+        },
+        CapabilitySet::V10 {
+            flags: CapabilitiesV10Flags::empty(),
+        },
+        CapabilitySet::V10_1,
+        CapabilitySet::V10_2 {
+            flags: CapabilitiesV10Flags::empty(),
+        },
+        CapabilitySet::V10_3 {
+            flags: CapabilitiesV103Flags::empty(),
+        },
+        CapabilitySet::V10_4 {
+            flags: CapabilitiesV104Flags::empty(),
+        },
+        CapabilitySet::V10_5 {
+            flags: CapabilitiesV104Flags::empty(),
+        },
+        CapabilitySet::V10_6 {
+            flags: CapabilitiesV104Flags::empty(),
+        },
+        CapabilitySet::V10_6Err {
+            flags: CapabilitiesV104Flags::empty(),
         },
         CapabilitySet::V10_7 {
             flags: CapabilitiesV107Flags::empty(),
         },
     ] {
-        assert_eq!(
-            capability_avc_support(&cap, false, EgfxCodecPolicy::ClearCodec),
-            (false, false)
-        );
+        for disable_avc444 in [false, true] {
+            assert_eq!(
+                capability_avc_support(&cap, disable_avc444, EgfxCodecPolicy::ClearCodec),
+                (false, false)
+            );
+        }
     }
+}
+
+#[test]
+fn clearcodec_policy_rejects_malformed_capabilities_and_recovers() {
+    use ironrdp_egfx::pdu::{CapabilitiesAdvertisePdu, CapabilitiesV107Flags, CapabilitySet};
+
+    let mut session = unnegotiated_egfx_session(16, 16, EgfxCodecPolicy::ClearCodec);
+    session.bridge.start(TEST_CHANNEL_ID).unwrap();
+    let mut caps = CapabilitiesAdvertisePdu::from_typed(&[CapabilitySet::V10_7 {
+        flags: CapabilitiesV107Flags::empty(),
+    }]);
+    caps.0[0].data.truncate(1);
+    let output = session
+        .bridge
+        .process(
+            TEST_CHANNEL_ID,
+            &encode_vec(&GfxPdu::CapabilitiesAdvertise(caps)).unwrap(),
+        )
+        .unwrap();
+    assert!(
+        output.is_empty(),
+        "malformed capability must not be confirmed"
+    );
+    assert!(!session.shared.is_ready());
+    super::test_support::process_avc444_capabilities(&mut session.bridge);
+    assert!(session.shared.is_ready());
+    assert!(!session.shared.is_avc_enabled());
 }
 
 #[test]
@@ -1394,13 +1517,23 @@ fn preferred_capabilities_keep_v10_auto_and_avc420_fallback() {
     );
 
     let clearcodec_caps = preferred_capabilities_for_policy(EgfxCodecPolicy::ClearCodec);
-    assert!(!clearcodec_caps.is_empty());
-    assert!(clearcodec_caps.iter().all(|cap| match cap {
-        CapabilitySet::V10_7 { flags } => flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
-        CapabilitySet::V10 { flags } => flags.contains(CapabilitiesV10Flags::AVC_DISABLED),
-        CapabilitySet::V8 { .. } => true,
-        _ => false,
-    }));
+    assert_eq!(
+        clearcodec_caps,
+        vec![
+            CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::empty()
+            },
+            CapabilitySet::V10 {
+                flags: CapabilitiesV10Flags::empty()
+            },
+            CapabilitySet::V8_1 {
+                flags: CapabilitiesV81Flags::empty()
+            },
+            CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::empty()
+            },
+        ]
+    );
 
     let avc444_caps = preferred_capabilities_for_policy(EgfxCodecPolicy::Avc444);
     assert!(matches!(

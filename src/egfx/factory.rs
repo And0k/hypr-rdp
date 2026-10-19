@@ -16,7 +16,7 @@ pub(super) fn capability_avc_support(
     codec_policy: EgfxCodecPolicy,
 ) -> (bool, bool) {
     use ironrdp_egfx::pdu::*;
-    if codec_policy == EgfxCodecPolicy::ClearCodec {
+    if !codec_policy.allows_avc() {
         return (false, false);
     }
     let (avc420, avc444) = match cap {
@@ -57,12 +57,17 @@ pub(super) fn preferred_capabilities_for_policy(
 ) -> Vec<ironrdp_egfx::pdu::CapabilitySet> {
     use ironrdp_egfx::pdu::*;
     match codec_policy {
+        // ClearCodec is mandatory at every version. Keep the capability ladder;
+        // local send policy selects it even if the confirm still permits AVC.
         EgfxCodecPolicy::ClearCodec => vec![
             CapabilitySet::V10_7 {
-                flags: CapabilitiesV107Flags::AVC_DISABLED,
+                flags: CapabilitiesV107Flags::empty(),
             },
             CapabilitySet::V10 {
-                flags: CapabilitiesV10Flags::AVC_DISABLED,
+                flags: CapabilitiesV10Flags::empty(),
+            },
+            CapabilitySet::V8_1 {
+                flags: CapabilitiesV81Flags::empty(),
             },
             CapabilitySet::V8 {
                 flags: CapabilitiesV8Flags::empty(),
@@ -232,10 +237,10 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
             tracing::info!(?cap, avc420, avc444, "EGFX: channel ready (first time)");
         }
         if !avc {
-            tracing::warn!(
+            tracing::info!(
                 ?cap,
                 policy = ?self.shared.codec_policy(),
-                "EGFX: negotiated capability has no AVC support; using ClearCodec"
+                "EGFX: using ClearCodec for negotiated capability and codec policy"
             );
         }
         self.shared.clear_frame_queue();
