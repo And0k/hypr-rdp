@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- Updated Rustls to 0.23.45 to fix TLS 1.3 handshake record-boundary validation (GHSA-2mjx-qc3c-rqvc).
 - Fixed clipboard text from X11 applications that offer only the `STRING` format.
 - Preserved locked clipboard file selections across clipboard replacement, with bounded retention and cleanup.
 - Fixed overlapping clipboard text and image copies so a delayed response does not discard the latest selection.
