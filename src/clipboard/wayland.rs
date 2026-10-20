@@ -219,7 +219,11 @@ impl ClipState {
     fn local_owner_changed(&self) {
         self.file_selection.clear();
         if let Some(inbound) = &self.inbound {
-            inbound.invalidate();
+            // Retire, not destroy: the desktop taking the clipboard says nothing
+            // about the client's, whose file list and lock are both still live.
+            // A paste already in progress keeps reading. Nothing on the remote
+            // expires here, so this selection leaves on the retirement ceiling.
+            inbound.retire();
         }
     }
 
@@ -464,6 +468,7 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                 if !formats.is_empty() {
                     announce_local_formats(
                         &state.event_sender,
+                        state.file_selection.files(),
                         &state.echo_candidate,
                         &state.clipboard_data,
                         &state.clipboard_image,

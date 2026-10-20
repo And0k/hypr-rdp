@@ -27,20 +27,57 @@ pub(super) struct InboundHandle {
 }
 
 impl InboundHandle {
-    pub(super) fn invalidate(&self) {
-        let _ = self.invalidate_selection();
+    /// Supersedes the advertised selection. Whatever was already mounted keeps
+    /// serving its open handles until its lock is released.
+    pub(super) fn retire(&self) {
+        let _ = self.retire_selection();
     }
 
-    fn invalidate_selection(&self) -> Option<u64> {
-        let generation = self.transfer.invalidate_generation();
+    fn retire_selection(&self) -> Option<u64> {
+        let (generation, _) = self.transfer.retire_generation();
+        self.drop_unpublished_files();
+        #[cfg(feature = "client-to-server")]
+        self.update_service(None, false);
+        generation
+    }
+
+    /// IronRDP sent the `Unlock` for these clipboard-data locks, so the remote
+    /// may drop their bytes: the selections they covered stop serving.
+    pub(super) fn release_locks(&self, data_ids: &[u32]) {
+        let current = self.transfer.generation();
+        let released = self.transfer.release_locks(data_ids);
+        if current.is_some_and(|generation| released.contains(&generation)) {
+            self.drop_unpublished_files();
+        }
+        if released.is_empty() {
+            return;
+        }
+        #[cfg(feature = "client-to-server")]
+        self.update_service(None, false);
+    }
+
+    fn drop_unpublished_files(&self) {
         if let Ok(mut pending) = self.pending.lock() {
             if matches!(*pending, Some(PendingWrite::Files { .. })) {
                 *pending = None;
             }
         }
-        #[cfg(feature = "client-to-server")]
-        self.update_service(None, false);
-        generation
+    }
+
+    #[cfg(all(test, feature = "client-to-server"))]
+    pub(super) fn read_first_file(
+        &self,
+        size: u32,
+    ) -> tokio::task::JoinHandle<Result<Vec<u8>, ()>> {
+        let generation = self.transfer.generation().unwrap();
+        let inode = self
+            .transfer
+            .with_tree(generation, |tree| tree.roots()[0])
+            .unwrap();
+        let transfer = self.transfer.clone();
+        self.transfer
+            .runtime
+            .spawn(async move { transfer.read(generation, inode, 0, size).await })
     }
 
     #[cfg(feature = "client-to-server")]
@@ -48,7 +85,9 @@ impl InboundHandle {
         let (state, changed) = &*self.service;
         if let Ok(mut state) = state.lock() {
             state.closed |= close;
-            state.job = job;
+            if job.is_some() {
+                state.job = job;
+            }
             state.dirty = true;
             changed.notify_one();
         }
@@ -107,11 +146,16 @@ impl InboundClipboard {
         self.handle.transfer.generation()
     }
     pub(super) fn begin_remote_copy(&self) -> Option<u64> {
-        self.handle.invalidate_selection()
+        self.handle.retire_selection()
     }
-    pub(super) fn set_capabilities(&self, stream: bool, huge: bool) {
-        self.handle.invalidate();
-        self.handle.transfer.capabilities(stream, huge);
+    pub(super) fn set_capabilities(&self, stream: bool, huge: bool, locking: bool) {
+        self.handle.drop_unpublished_files();
+        self.handle.transfer.capabilities(stream, huge, locking);
+        #[cfg(feature = "client-to-server")]
+        self.handle.update_service(None, false);
+    }
+    pub(super) fn release_locks(&self, data_ids: &[u32]) {
+        self.handle.release_locks(data_ids);
     }
     pub(super) fn on_response(&self, response: FileContentsResponse<'_>) {
         self.handle.transfer.on_response(response);
@@ -130,7 +174,7 @@ impl InboundClipboard {
         data_id: Option<u32>,
     ) {
         #[cfg(feature = "client-to-server")]
-        if let Some((generation, roots)) =
+        if let Some((generation, roots, _)) =
             self.handle.transfer.accept_for(generation, files, data_id)
         {
             self.handle
@@ -144,7 +188,7 @@ impl InboundClipboard {
 impl Drop for InboundClipboard {
     fn drop(&mut self) {
         self.handle.transfer.close();
-        self.handle.invalidate();
+        self.handle.drop_unpublished_files();
         #[cfg(feature = "client-to-server")]
         self.handle.update_service(None, true);
     }
@@ -178,7 +222,9 @@ fn serve<M: Mounted>(
     handle: InboundHandle,
     mut create: impl FnMut(filesystem::RemoteFilesystem) -> Option<M>,
 ) {
-    let mut mounted = None;
+    // One mount per selection that is still serving: the live one, plus every
+    // retired one whose clipboard-data lock the remote still honours.
+    let mut mounted: std::collections::HashMap<u64, M> = std::collections::HashMap::new();
     loop {
         let (state, changed) = &*handle.service;
         let job = {
@@ -193,9 +239,16 @@ fn serve<M: Mounted>(
             state.dirty = false;
             state.job.take()
         };
-        drop(mounted.take());
+        // Reconcile against the transfer owner instead of accumulating release
+        // notifications while a filesystem operation is blocked.
+        mounted.retain(|generation, _| handle.transfer.with_tree(*generation, |_| ()).is_some());
         let Some(job) = job else { continue };
-        if job.roots.is_empty() || handle.transfer.with_tree(job.generation, |_| ()).is_none() {
+        if job.roots.is_empty()
+            || handle
+                .transfer
+                .with_live_tree(job.generation, |_| ())
+                .is_none()
+        {
             continue;
         }
         let filesystem = filesystem::RemoteFilesystem::new(handle.transfer.clone(), job.generation);
@@ -203,10 +256,10 @@ fn serve<M: Mounted>(
             continue;
         };
         // Creation may block while a new copy, local owner change, or close arrives.
-        // Only the same live generation can publish its newly created path.
+        // Only the still-live generation can publish its newly created path.
         let published = handle
             .transfer
-            .with_tree(job.generation, |_| {
+            .with_live_tree(job.generation, |_| {
                 let Some(payload) = uri_payload(mount.path(), &job.roots) else {
                     return false;
                 };
@@ -218,7 +271,7 @@ fn serve<M: Mounted>(
             })
             .unwrap_or(false);
         if published {
-            mounted = Some(mount);
+            mounted.insert(job.generation, mount);
         }
     }
     // M's destructor runs here, never on a protocol callback or Wayland watcher.
@@ -289,7 +342,7 @@ mod tests {
     async fn inbound_mount_publication_respects_generation_and_close() {
         for close in [false, true] {
             let clipboard = unstarted();
-            clipboard.set_capabilities(true, true);
+            clipboard.set_capabilities(true, true, true);
             let pending = Arc::clone(&clipboard.handle.pending);
             let handle = clipboard.handle();
             let (started, started_rx) = std::sync::mpsc::channel();
@@ -310,7 +363,7 @@ mod tests {
                 drop(clipboard);
                 None
             } else {
-                clipboard.handle.invalidate();
+                clipboard.handle.retire();
                 Some(clipboard)
             };
             release.send(()).unwrap();
@@ -327,7 +380,7 @@ mod tests {
     #[tokio::test]
     async fn inbound_mount_failure_keeps_other_clipboard_content() {
         let clipboard = unstarted();
-        clipboard.set_capabilities(true, true);
+        clipboard.set_capabilities(true, true, true);
         let pending = Arc::clone(&clipboard.handle.pending);
         *pending.lock().unwrap() = Some(PendingWrite::Text(b"usable".to_vec()));
         let handle = clipboard.handle();
@@ -350,7 +403,7 @@ mod tests {
     #[tokio::test]
     async fn inbound_mount_success_publishes_exact_selection() {
         let clipboard = unstarted();
-        clipboard.set_capabilities(true, true);
+        clipboard.set_capabilities(true, true, true);
         let handle = clipboard.handle();
         let (dropped, drops) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -405,6 +458,72 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn inbound_retained_mounts_release_only_the_matching_generation_and_close_all() {
+        struct TaggedMount {
+            path: std::path::PathBuf,
+            dropped: std::sync::mpsc::Sender<std::path::PathBuf>,
+        }
+        impl Mounted for TaggedMount {
+            fn path(&self) -> &Path {
+                &self.path
+            }
+        }
+        impl Drop for TaggedMount {
+            fn drop(&mut self) {
+                self.dropped.send(self.path.clone()).unwrap();
+            }
+        }
+        let clipboard = unstarted();
+        clipboard.set_capabilities(true, true, true);
+        let handle = clipboard.handle();
+        let (dropped, drops) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut serial = 0;
+            serve(handle, |_| {
+                serial += 1;
+                Some(TaggedMount {
+                    path: format!("/fake/{serial}").into(),
+                    dropped: dropped.clone(),
+                })
+            });
+        });
+        for id in [77, 88, 99] {
+            clipboard.accept(&[FileDescriptor::new("file").with_file_size(1)], Some(id));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if clipboard.handle.pending.lock().unwrap().take().is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        assert!(
+            drops.try_recv().is_err(),
+            "replacement must retain all three mounts"
+        );
+        clipboard.release_locks(&[77]);
+        assert_eq!(
+            drops.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Path::new("/fake/1")
+        );
+        assert!(
+            drops.try_recv().is_err(),
+            "A's unlock must not unmount B or C"
+        );
+        drop(clipboard);
+        worker.join().unwrap();
+        let mut remaining = vec![
+            drops.recv_timeout(Duration::from_secs(2)).unwrap(),
+            drops.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ];
+        remaining.sort();
+        assert_eq!(remaining, [Path::new("/fake/2"), Path::new("/fake/3")]);
+    }
+
     /// Runs only in a FUSE-capable validation environment. The oracle copies bytes
     /// through production lookup/getattr/read, including the unknown-size path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -425,7 +544,7 @@ mod tests {
         let (sender, mut events) = mpsc::unbounded_channel();
         let pending = Arc::new(Mutex::new(None));
         let clipboard = Arc::new(InboundClipboard::new(sender, Arc::clone(&pending), 100, 3));
-        clipboard.set_capabilities(true, true);
+        clipboard.set_capabilities(true, true, true);
         clipboard.accept(
             &[
                 FileDescriptor::new("folder").with_attributes(ClipboardFileAttributes::DIRECTORY),
@@ -437,16 +556,26 @@ mod tests {
                     .with_relative_path("folder")
                     .with_attributes(ClipboardFileAttributes::DIRECTORY),
             ],
-            None,
+            Some(77),
         );
+        let (read_started, started) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
         let responder = Arc::clone(&clipboard);
         let responder = tokio::spawn(async move {
+            let mut barrier = Some((read_started, resumed));
             while let Some(ServerEvent::Clipboard(ClipboardMessage::SendFileContentsRequest(req))) =
                 events.recv().await
             {
-                let bytes = match req.index {
-                    1 => b"hello world".as_slice(),
-                    2 => b"unknown bytes".as_slice(),
+                if req.flags == FileContentsFlags::RANGE {
+                    if let Some((started, resumed)) = barrier.take() {
+                        started.send(()).unwrap();
+                        resumed.await.unwrap();
+                    }
+                }
+                let bytes = match (req.data_id, req.index) {
+                    (Some(88), 0) => b"replacement bytes".as_slice(),
+                    (Some(77), 1) => b"hello world".as_slice(),
+                    (Some(77), 2) => b"unknown bytes".as_slice(),
                     _ => panic!("bad descriptor index"),
                 };
                 let response = if req.flags == FileContentsFlags::SIZE {
@@ -501,14 +630,65 @@ mod tests {
             );
             assert!(destination.join("empty").is_dir());
         });
+        tokio::time::timeout(Duration::from_secs(10), started)
+            .await
+            .unwrap()
+            .unwrap();
+        // Replace the clipboard while the kernel copy is waiting for A's bytes.
+        clipboard.accept(
+            &[FileDescriptor::new("replacement").with_file_size(17)],
+            Some(88),
+        );
+        let replacement = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(PendingWrite::Files { uri_list, .. }) = pending.lock().unwrap().take() {
+                    break url::Url::parse(std::str::from_utf8(&uri_list).unwrap().trim())
+                        .unwrap()
+                        .to_file_path()
+                        .unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let replacement_mount = replacement.parent().unwrap().to_owned();
+        assert_ne!(mount_path, replacement_mount);
+        resume.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(10), copied)
             .await
             .unwrap()
             .unwrap();
+        let replacement_copy = replacement.clone();
+        let destination = runtime.join("replacement-copy");
+        let copied = tokio::task::spawn_blocking(move || {
+            std::fs::copy(replacement_copy, &destination).unwrap();
+            assert_eq!(std::fs::read(destination).unwrap(), b"replacement bytes");
+        });
+        tokio::time::timeout(Duration::from_secs(10), copied)
+            .await
+            .unwrap()
+            .unwrap();
+        clipboard.release_locks(&[77]);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime
+                .read_dir()
+                .unwrap()
+                .any(|entry| entry.unwrap().path() == mount_path)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("only A's mount must be released");
+        assert!(
+            replacement_mount.is_dir(),
+            "B's mount must survive A's unlock"
+        );
         responder.abort();
         let _ = responder.await;
         drop(clipboard);
-        let mount_name = mount_path.file_name().unwrap();
+        let mount_name = replacement_mount.file_name().unwrap();
         let mut claim_name = mount_name.to_owned();
         claim_name.push(".lock");
         tokio::time::timeout(Duration::from_secs(5), async {

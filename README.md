@@ -140,8 +140,11 @@ Run `hypr-rdp --help` for all options.
 Clipboard file transfer copies files or folders in either file manager and
 pastes them into the other; the RDP client must support clipboard file
 streaming. Cut acts as copy and source files are never deleted, so keep them
-unchanged until the transfer finishes. Wait for a transfer to finish before
-copying another selection.
+unchanged until the transfer finishes. When the client negotiates clipboard-data
+locking, an active paste can keep reading its original selection after another
+selection is copied. Up to four replaced inbound selections are retained until
+their locks are released; older selections are cancelled at that limit. Without
+locking, wait for a transfer to finish before copying another selection.
 
 ### Session hooks
 
