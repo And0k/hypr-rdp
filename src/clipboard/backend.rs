@@ -36,7 +36,8 @@ pub(super) struct ClipboardEchoCandidate {
 }
 
 /// Sends one locally originated format list and snapshots its advertised data.
-/// The snapshot is eligible for the next remote paste request only.
+/// The next remote selection fetch consumes the snapshot once, after draining
+/// any superseded responses from coalesced notifications.
 pub(super) fn announce_local_formats(
     event_sender: &mpsc::UnboundedSender<ServerEvent>,
     files: &FrozenFiles,
@@ -152,17 +153,17 @@ impl CliprdrBackendFactory for HyprCliprdrFactory {
             files,
             file_worker,
             inbound,
-            file_list_request: None,
+            remote_request: None,
         })
     }
 }
 
 impl CliprdrServerFactory for HyprCliprdrFactory {}
 
-/// File-list responses have no request ID. Drain an invalidated exchange before
-/// asking for the latest selection, including when that selection is text.
-enum FileListRequest {
-    Waiting(u64),
+/// Keep one application selection context for untagged format-data responses.
+/// Drain a superseded response before requesting the latest text, image or file list.
+enum RemoteRequest {
+    Waiting(Option<u64>),
     Draining(Option<RemoteSelectionRequest>),
 }
 
@@ -186,7 +187,7 @@ struct HyprCliprdrBackend {
     files: FrozenFiles,
     file_worker: Option<FileWorker>,
     inbound: Option<InboundClipboard>,
-    file_list_request: Option<FileListRequest>,
+    remote_request: Option<RemoteRequest>,
 }
 
 impl_as_any!(HyprCliprdrBackend);
@@ -319,16 +320,18 @@ impl CliprdrBackend for HyprCliprdrBackend {
         });
         let file_generation = file_format.and(remote_generation);
 
-        if self.file_list_request.is_some()
-            || (file_format.is_some() && self.last_requested_format.is_some())
-        {
-            self.file_list_request = Some(FileListRequest::Draining(format.map(|format| {
+        if self.remote_request.is_some() || self.last_requested_format.is_some() {
+            self.remote_request = Some(RemoteRequest::Draining(format.map(|format| {
                 RemoteSelectionRequest {
                     format,
                     file_generation,
                 }
             })));
-            self.pending_echo_candidate = echo_candidate;
+            // Duplicate notifications can belong to the same local-origin copy.
+            // Preserve its one-shot candidate until the latest response is consumed.
+            if echo_candidate.is_some() {
+                self.pending_echo_candidate = echo_candidate;
+            }
             return;
         }
 
@@ -338,24 +341,11 @@ impl CliprdrBackend for HyprCliprdrBackend {
             return;
         };
 
-        // Format Data Responses carry no request ID. Keep one request state for
-        // repeated announcements that select the same format.
-        if self.last_requested_format == Some(format) {
-            return;
-        }
-
-        if let Some(ref sender) = self.event_sender {
-            if sender
-                .send(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
-                    format,
-                )))
-                .is_ok()
-            {
-                self.last_requested_format = Some(format);
-                self.file_list_request = file_generation.map(FileListRequest::Waiting);
-                self.pending_echo_candidate = echo_candidate;
-            }
-        }
+        self.pending_echo_candidate = echo_candidate;
+        self.request_remote_selection(RemoteSelectionRequest {
+            format,
+            file_generation,
+        });
     }
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
@@ -394,11 +384,15 @@ impl CliprdrBackend for HyprCliprdrBackend {
     }
 
     fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
-        if let Some(request) = self.file_list_request.take() {
-            self.finish_file_list_request(request);
-            return;
+        match self.remote_request.take() {
+            Some(request @ RemoteRequest::Draining(_))
+            | Some(request @ RemoteRequest::Waiting(Some(_))) => {
+                self.finish_remote_request(request);
+            }
+            Some(RemoteRequest::Waiting(None)) | None => {
+                self.handle_format_data_response(response, MAX_CLIPBOARD_SIZE);
+            }
         }
-        self.handle_format_data_response(response, MAX_CLIPBOARD_SIZE);
     }
 
     fn on_file_contents_request(&mut self, request: FileContentsRequest) {
@@ -422,15 +416,15 @@ impl CliprdrBackend for HyprCliprdrBackend {
     }
 
     fn on_remote_file_list(&mut self, files: &[FileDescriptor], data_id: Option<u32>) {
-        match self.file_list_request.take() {
-            Some(FileListRequest::Waiting(generation)) => {
+        match self.remote_request.take() {
+            Some(RemoteRequest::Waiting(Some(generation))) => {
                 self.last_requested_format = None;
                 self.pending_echo_candidate = None;
                 if let Some(inbound) = &self.inbound {
                     inbound.accept_for(generation, files, data_id);
                 }
             }
-            Some(request @ FileListRequest::Draining(_)) => self.finish_file_list_request(request),
+            Some(request) => self.finish_remote_request(request),
             None => {}
         }
     }
@@ -456,31 +450,31 @@ impl CliprdrBackend for HyprCliprdrBackend {
 }
 
 impl HyprCliprdrBackend {
-    fn finish_file_list_request(&mut self, request: FileListRequest) {
+    fn finish_remote_request(&mut self, request: RemoteRequest) {
         self.last_requested_format = None;
-        let FileListRequest::Draining(Some(RemoteSelectionRequest {
-            format,
-            file_generation,
-        })) = request
-        else {
+        let RemoteRequest::Draining(Some(selection)) = request else {
             self.pending_echo_candidate = None;
             return;
         };
-        if file_generation.is_some_and(|generation| {
+        if selection.file_generation.is_some_and(|generation| {
             self.inbound.as_ref().and_then(InboundClipboard::generation) != Some(generation)
         }) {
             self.pending_echo_candidate = None;
             return;
         }
+        self.request_remote_selection(selection);
+    }
+
+    fn request_remote_selection(&mut self, selection: RemoteSelectionRequest) {
         if let Some(sender) = &self.event_sender {
             if sender
                 .send(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
-                    format,
+                    selection.format,
                 )))
                 .is_ok()
             {
-                self.last_requested_format = Some(format);
-                self.file_list_request = file_generation.map(FileListRequest::Waiting);
+                self.last_requested_format = Some(selection.format);
+                self.remote_request = Some(RemoteRequest::Waiting(selection.file_generation));
                 return;
             }
         }
@@ -724,7 +718,7 @@ mod tests {
                 files: Arc::new(Mutex::new(None.into())),
                 file_worker: None,
                 inbound: None,
-                file_list_request: None,
+                remote_request: None,
             },
             event_rx,
         )
@@ -809,7 +803,7 @@ mod tests {
                 events.try_recv().is_err(),
                 "a deferred stale request must not be sent"
             );
-            assert!(backend.file_list_request.is_none());
+            assert!(backend.remote_request.is_none());
             assert!(backend.pending_write.lock().unwrap().is_none());
             backend.on_remote_copy(&[incoming_file_format(0xc003)]);
             assert_eq!(take_paste(&mut events), ClipboardFormatId::new(0xc003));
@@ -987,7 +981,7 @@ mod tests {
             files,
             file_worker: Some(worker),
             inbound: None,
-            file_list_request: None,
+            remote_request: None,
         };
 
         backend.on_file_contents_request(FileContentsRequest {
@@ -1277,46 +1271,51 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_format_list_reuses_the_outstanding_echo_request() {
-        let (mut backend, mut event_rx) = backend_with_events();
-        *backend.clipboard_data.lock().unwrap() = Some(b"hello\nworld".to_vec());
-        backend.on_request_format_list();
-        let _ = recv_clipboard_event(&mut event_rx);
+    fn duplicate_format_lists_drain_then_preserve_one_shot_echo() {
+        for fail_old in [false, true] {
+            let (mut backend, mut event_rx) = backend_with_events();
+            *backend.clipboard_data.lock().unwrap() = Some(b"hello\nworld".to_vec());
+            backend.on_request_format_list();
+            let _ = recv_clipboard_event(&mut event_rx);
 
-        let formats = [ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
-        backend.on_remote_copy(&formats);
-        assert!(matches!(
-            recv_clipboard_event(&mut event_rx),
-            ClipboardMessage::SendInitiatePaste(ClipboardFormatId::CF_UNICODETEXT)
-        ));
+            let formats = [ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+            backend.on_remote_copy(&formats);
+            assert!(matches!(
+                recv_clipboard_event(&mut event_rx),
+                ClipboardMessage::SendInitiatePaste(ClipboardFormatId::CF_UNICODETEXT)
+            ));
+            backend.on_remote_copy(&formats);
+            assert!(event_rx.try_recv().is_err());
 
-        backend.on_remote_copy(&formats);
-        assert!(event_rx.try_recv().is_err());
+            let payload = utf16le("hello\r\nworld");
+            backend.on_format_data_response(if fail_old {
+                FormatDataResponse::new_error()
+            } else {
+                FormatDataResponse::new_data(&payload)
+            });
+            assert!(backend.pending_write.lock().unwrap().is_none());
+            assert!(matches!(
+                recv_clipboard_event(&mut event_rx),
+                ClipboardMessage::SendInitiatePaste(ClipboardFormatId::CF_UNICODETEXT)
+            ));
+            assert!(backend.pending_echo_candidate.is_some());
+            backend.on_format_data_response(FormatDataResponse::new_data(&payload));
+            assert!(backend.pending_write.lock().unwrap().is_none());
+            assert!(backend.last_requested_format.is_none());
+            assert!(backend.remote_request.is_none());
+            assert!(backend.pending_echo_candidate.is_none());
 
-        let payload = utf16le("hello\r\nworld");
-        backend.handle_format_data_response(
-            FormatDataResponse::new_data(payload.as_slice()),
-            MAX_CLIPBOARD_SIZE,
-        );
-
-        assert!(backend.pending_write.lock().unwrap().is_none());
-        assert!(backend.last_requested_format.is_none());
-        assert!(backend.pending_echo_candidate.is_none());
-
-        backend.on_remote_copy(&formats);
-        assert!(matches!(
-            recv_clipboard_event(&mut event_rx),
-            ClipboardMessage::SendInitiatePaste(ClipboardFormatId::CF_UNICODETEXT)
-        ));
-        backend.handle_format_data_response(
-            FormatDataResponse::new_data(payload.as_slice()),
-            MAX_CLIPBOARD_SIZE,
-        );
-
-        assert!(matches!(
-            backend.pending_write.lock().unwrap().as_ref(),
-            Some(PendingWrite::Text(text)) if text == b"hello\nworld"
-        ));
+            backend.on_remote_copy(&formats);
+            assert!(matches!(
+                recv_clipboard_event(&mut event_rx),
+                ClipboardMessage::SendInitiatePaste(ClipboardFormatId::CF_UNICODETEXT)
+            ));
+            backend.on_format_data_response(FormatDataResponse::new_data(&payload));
+            assert!(matches!(
+                backend.pending_write.lock().unwrap().as_ref(),
+                Some(PendingWrite::Text(text)) if text == b"hello\nworld"
+            ));
+        }
     }
 
     #[test]
@@ -1573,7 +1572,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_copy_clears_stale_requested_format_when_no_supported_format_exists() {
+    fn remote_copy_drains_stale_request_when_no_supported_format_exists() {
         let (mut backend, mut event_rx) = backend_with_events();
 
         backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
@@ -1589,7 +1588,19 @@ mod tests {
 
         backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_TEXT)]);
 
-        assert_eq!(backend.last_requested_format, None);
+        assert_eq!(
+            backend.last_requested_format,
+            Some(ClipboardFormatId::CF_UNICODETEXT)
+        );
+        assert!(matches!(
+            backend.remote_request,
+            Some(RemoteRequest::Draining(None))
+        ));
+        assert!(event_rx.try_recv().is_err());
+        backend.on_format_data_response(FormatDataResponse::new_unicode_string("stale"));
+        assert!(backend.pending_write.lock().unwrap().is_none());
+        assert!(backend.last_requested_format.is_none());
+        assert!(backend.remote_request.is_none());
         assert!(event_rx.try_recv().is_err());
     }
 
@@ -2280,5 +2291,261 @@ mod tests {
         assert_eq!(recv_file_response(&mut events).data(), b"new-B");
         drop(channel);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    mod remote_request_tests {
+        use super::*;
+        use ironrdp_cliprdr::pdu::{
+            Capabilities, ClipboardPdu, ClipboardProtocolVersion, FormatList,
+        };
+        use ironrdp_cliprdr::CliprdrServer;
+        use ironrdp_svc::{SvcMessage, SvcProcessor};
+
+        struct Replay {
+            channel: CliprdrServer,
+            events: mpsc::UnboundedReceiver<ServerEvent>,
+            pending: Arc<Mutex<Option<PendingWrite>>>,
+        }
+
+        impl Replay {
+            fn new() -> Self {
+                #[cfg(feature = "client-to-server")]
+                let (backend, events) = inbound_backend();
+                #[cfg(not(feature = "client-to-server"))]
+                let (backend, events) = backend_with_events();
+                let flags = backend.client_capabilities();
+                let pending = Arc::clone(&backend.pending_write);
+                let mut channel = CliprdrServer::new(Box::new(ReplayBackend(backend)));
+                channel.start().unwrap();
+                let mut replay = Self {
+                    channel,
+                    events,
+                    pending,
+                };
+                replay.process(ClipboardPdu::Capabilities(Capabilities::new(
+                    ClipboardProtocolVersion::V2,
+                    flags,
+                )));
+                replay
+            }
+
+            fn process(&mut self, pdu: ClipboardPdu<'_>) {
+                self.channel
+                    .process(&ironrdp_core::encode_vec(&pdu).unwrap())
+                    .unwrap();
+            }
+
+            fn announce(&mut self, format: ClipboardFormatId) {
+                let formats = [ClipboardFormat::new(format)];
+                self.process(ClipboardPdu::FormatList(
+                    FormatList::new_unicode(&formats, true).unwrap(),
+                ));
+            }
+
+            fn send_request(&mut self, expected: ClipboardFormatId) {
+                let event = self
+                    .events
+                    .try_recv()
+                    .expect("latest selection must be requested");
+                let ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(format)) = event
+                else {
+                    panic!("expected a paste request, got {event:?}");
+                };
+                assert_eq!(format, expected);
+                let messages: Vec<SvcMessage> = self.channel.initiate_paste(format).unwrap().into();
+                assert_eq!(messages.len(), 1);
+                let bytes = messages[0].encode_unframed_pdu().unwrap();
+                assert!(
+                    matches!(ironrdp_core::decode::<ClipboardPdu<'_>>(&bytes).unwrap(),
+                    ClipboardPdu::FormatDataRequest(request) if request.format == expected)
+                );
+            }
+
+            fn no_request(&mut self) {
+                assert!(
+                    self.events.try_recv().is_err(),
+                    "do not overlap untagged response contexts"
+                );
+            }
+
+            fn respond(&mut self, format: ClipboardFormatId, text: &str) {
+                if format == ClipboardFormatId::CF_UNICODETEXT {
+                    self.process(ClipboardPdu::FormatDataResponse(
+                        FormatDataResponse::new_unicode_string(text),
+                    ));
+                } else {
+                    let dib = if format == ClipboardFormatId::CF_DIBV5 {
+                        ironrdp_cliprdr_format::bitmap::png_to_cf_dibv5(ONE_BY_ONE_RGBA_PNG)
+                            .unwrap()
+                    } else {
+                        ironrdp_cliprdr_format::bitmap::png_to_cf_dib(ONE_BY_ONE_RGBA_PNG).unwrap()
+                    };
+                    self.process(ClipboardPdu::FormatDataResponse(
+                        FormatDataResponse::new_data(&dib),
+                    ));
+                }
+            }
+
+            fn assert_latest(&self, format: ClipboardFormatId) {
+                let pending = self.pending.lock().unwrap();
+                match pending
+                    .as_ref()
+                    .expect("the latest valid response must be published")
+                {
+                    PendingWrite::Text(bytes) => {
+                        assert_eq!(format, ClipboardFormatId::CF_UNICODETEXT);
+                        assert_eq!(bytes, b"latest");
+                    }
+                    PendingWrite::Image(bytes) => {
+                        let expected = if format == ClipboardFormatId::CF_DIBV5 {
+                            let dib = ironrdp_cliprdr_format::bitmap::png_to_cf_dibv5(
+                                ONE_BY_ONE_RGBA_PNG,
+                            )
+                            .unwrap();
+                            ironrdp_cliprdr_format::bitmap::dibv5_to_png(&dib).unwrap()
+                        } else {
+                            assert_eq!(format, ClipboardFormatId::CF_DIB);
+                            let dib =
+                                ironrdp_cliprdr_format::bitmap::png_to_cf_dib(ONE_BY_ONE_RGBA_PNG)
+                                    .unwrap();
+                            ironrdp_cliprdr_format::bitmap::dib_to_png(&dib).unwrap()
+                        };
+                        assert_eq!(*bytes, expected);
+                    }
+                    _ => panic!("unexpected file publication"),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn overlapping_selections_fetch_latest_after_success_or_failure() {
+            for old in [
+                ClipboardFormatId::CF_UNICODETEXT,
+                ClipboardFormatId::CF_DIB,
+                ClipboardFormatId::CF_DIBV5,
+            ] {
+                for latest in [
+                    ClipboardFormatId::CF_UNICODETEXT,
+                    ClipboardFormatId::CF_DIB,
+                    ClipboardFormatId::CF_DIBV5,
+                ] {
+                    for fail_old in [false, true] {
+                        let mut replay = Replay::new();
+                        replay.announce(old);
+                        replay.send_request(old);
+                        for _ in 0..3 {
+                            replay.announce(latest);
+                        }
+                        replay.no_request();
+                        if fail_old {
+                            replay.process(ClipboardPdu::FormatDataResponse(
+                                FormatDataResponse::new_error(),
+                            ));
+                        } else {
+                            replay.respond(old, "stale");
+                        }
+                        assert!(
+                            replay.pending.lock().unwrap().is_none(),
+                            "do not publish a superseded response"
+                        );
+                        replay.send_request(latest);
+                        replay.no_request();
+                        replay.respond(latest, "latest");
+                        replay.assert_latest(latest);
+                        replay.pending.lock().unwrap().take();
+                        replay.announce(ClipboardFormatId::CF_UNICODETEXT);
+                        replay.send_request(ClipboardFormatId::CF_UNICODETEXT);
+                        replay.respond(ClipboardFormatId::CF_UNICODETEXT, "latest");
+                        replay.assert_latest(ClipboardFormatId::CF_UNICODETEXT);
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn unsupported_selection_drains_old_response_before_new_copy() {
+            let mut replay = Replay::new();
+            replay.announce(ClipboardFormatId::CF_UNICODETEXT);
+            replay.send_request(ClipboardFormatId::CF_UNICODETEXT);
+            replay.announce(ClipboardFormatId::CF_TEXT);
+            replay.no_request();
+            replay.respond(ClipboardFormatId::CF_UNICODETEXT, "stale");
+            replay.no_request();
+            assert!(replay.pending.lock().unwrap().is_none());
+            replay.announce(ClipboardFormatId::CF_UNICODETEXT);
+            replay.send_request(ClipboardFormatId::CF_UNICODETEXT);
+            replay.respond(ClipboardFormatId::CF_UNICODETEXT, "latest");
+            replay.assert_latest(ClipboardFormatId::CF_UNICODETEXT);
+        }
+
+        #[test]
+        fn new_local_announcement_replaces_deferred_echo_candidate() {
+            let (mut backend, mut events) = backend_with_events();
+            *backend.clipboard_data.lock().unwrap() = Some(b"old local".to_vec());
+            backend.on_request_format_list();
+            recv_clipboard_event(&mut events);
+            let formats = [ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+            backend.on_remote_copy(&formats);
+            recv_clipboard_event(&mut events);
+            *backend.clipboard_data.lock().unwrap() = Some(b"new local".to_vec());
+            backend.on_request_format_list();
+            recv_clipboard_event(&mut events);
+            backend.on_remote_copy(&formats);
+            assert!(events.try_recv().is_err());
+            backend.on_format_data_response(FormatDataResponse::new_unicode_string("old local"));
+            recv_clipboard_event(&mut events);
+            backend.on_format_data_response(FormatDataResponse::new_unicode_string("new local"));
+            assert!(backend.pending_write.lock().unwrap().is_none());
+            assert!(backend.pending_echo_candidate.is_none());
+            backend.on_remote_copy(&formats);
+            recv_clipboard_event(&mut events);
+            backend.on_format_data_response(FormatDataResponse::new_unicode_string("new local"));
+            assert!(
+                matches!(backend.pending_write.lock().unwrap().as_ref(),Some(PendingWrite::Text(bytes)) if bytes == b"new local")
+            );
+        }
+
+        #[test]
+        fn deferred_request_send_failure_clears_wait_and_echo() {
+            let (mut backend, mut events) = backend_with_events();
+            *backend.clipboard_data.lock().unwrap() = Some(b"local".to_vec());
+            backend.on_request_format_list();
+            recv_clipboard_event(&mut events);
+            let formats = [ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+            backend.on_remote_copy(&formats);
+            recv_clipboard_event(&mut events);
+            backend.on_remote_copy(&formats);
+            assert!(backend.pending_echo_candidate.is_some());
+            drop(events);
+            backend.on_format_data_response(FormatDataResponse::new_unicode_string("stale"));
+            assert!(backend.last_requested_format.is_none());
+            assert!(backend.remote_request.is_none());
+            assert!(backend.pending_echo_candidate.is_none());
+            assert!(backend.pending_write.lock().unwrap().is_none());
+        }
+
+        proptest! {
+            #[test]
+            fn generated_remote_selection_bursts_keep_latest_response(
+                choices in proptest::collection::vec(0u8..3, 1..32), fail_old in any::<bool>(),
+            ) {
+                let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                let _guard = runtime.enter();
+                let formats = [ClipboardFormatId::CF_UNICODETEXT, ClipboardFormatId::CF_DIB, ClipboardFormatId::CF_DIBV5];
+                let mut replay = Replay::new();
+                replay.announce(formats[0]);
+                replay.send_request(formats[0]);
+                for choice in &choices { replay.announce(formats[usize::from(*choice)]); }
+                replay.no_request();
+                if fail_old { replay.process(ClipboardPdu::FormatDataResponse(FormatDataResponse::new_error())); }
+                else { replay.respond(formats[0], "stale"); }
+                prop_assert!(replay.pending.lock().unwrap().is_none());
+                let latest = formats[usize::from(*choices.last().unwrap())];
+                replay.send_request(latest);
+                replay.no_request();
+                replay.respond(latest, "latest");
+                replay.assert_latest(latest);
+            }
+        }
     }
 }
