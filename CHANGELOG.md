@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.7] - 2026-10-20
+
+### Added
+
+- Added opt-in Linux password authentication through PAM for the user running the desktop, with bounded authentication and account checks.
+- Added `egfx_codec = "clearcodec"` / `--egfx-codec clearcodec` to select ClearCodec even when the client supports AVC.
+
+### Fixed
+
+- Fixed clipboard text from X11 applications that offer only the `STRING` format.
+- Preserved locked clipboard file selections across clipboard replacement, with bounded retention and cleanup.
+- Fixed overlapping clipboard text and image copies so a delayed response does not discard the latest selection.
+- Restored authenticated session hooks when explicit credentials are configured.
+- Adopted upstream authentication-denial framing and made connection failures visible at the default log level.
+- Released DMA-BUF capture resources on fallback, resize and shutdown, corrected VA-API cleanup order, and closed rejected exported file descriptors.
+- Bounded pending EGFX output across reconnects.
+- Included the PAM runtime dependency and Arch PAM service in the stable AUR package.
+
 ## [0.1.6] - 2026-09-10
 
 ### Added
