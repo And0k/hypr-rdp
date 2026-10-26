@@ -14,8 +14,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use ironrdp_displaycontrol::pdu::{DisplayControlMonitorLayout, MonitorOrientation};
 use ironrdp_server::{
-    DesktopSize, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates, ServerError,
-    ServerErrorExt as _, ServerResult,
+    DesktopSize, DisplayContext, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates,
+    ServerError, ServerErrorExt as _, ServerResult,
 };
 use tokio::sync::{mpsc, Mutex};
 
@@ -770,34 +770,8 @@ impl HyprDisplay {
     }
 }
 
-#[async_trait]
-impl RdpServerDisplay for HyprDisplay {
-    async fn size(&mut self) -> DesktopSize {
-        let inner = self.inner.lock().await;
-        DesktopSize {
-            width: inner.width,
-            height: inner.height,
-        }
-    }
-
-    async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
-        self.request_initial_size_with(
-            client_size,
-            |name, width, height, scale| resize_headless_output(&name, width, height, scale),
-            SharedOutputLayout::prepare_from_output_with_presentation,
-        )
-        .await
-    }
-
-    fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
-        self.request_layout_with(
-            layout,
-            resize_headless_output,
-            SharedOutputLayout::update_from_output_with_presentation,
-        );
-    }
-
-    async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+impl HyprDisplay {
+    async fn start_capture_updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         // A client may skip initial-size negotiation altogether. Capture must
         // still wait for a canceled previous session's external mutation.
         let gate = Arc::clone(&self.inner.lock().await.resize_gate);
@@ -869,6 +843,43 @@ impl RdpServerDisplay for HyprDisplay {
         }
 
         Ok(Box::new(HyprDisplayUpdates { rx, capture_dead }))
+    }
+}
+
+#[async_trait]
+impl RdpServerDisplay for HyprDisplay {
+    async fn size(&mut self) -> DesktopSize {
+        let inner = self.inner.lock().await;
+        DesktopSize {
+            width: inner.width,
+            height: inner.height,
+        }
+    }
+
+    async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
+        self.request_initial_size_with(
+            client_size,
+            |name, width, height, scale| resize_headless_output(&name, width, height, scale),
+            SharedOutputLayout::prepare_from_output_with_presentation,
+        )
+        .await
+    }
+
+    fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
+        self.request_layout_with(
+            layout,
+            resize_headless_output,
+            SharedOutputLayout::update_from_output_with_presentation,
+        );
+    }
+
+    async fn updates(
+        &mut self,
+        _ctx: DisplayContext,
+    ) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+        // Capture keeps its existing policy; connection-specific suppression and
+        // auto-detect handles are not used by this backend.
+        self.start_capture_updates().await
     }
 }
 
@@ -1507,7 +1518,10 @@ mod output_downscaling {
     fn physical_output_displaycontrol_rejects_multi_monitor_layouts() {
         let monitors = [
             MonitorLayoutEntry::new_primary(1280, 720).unwrap(),
-            MonitorLayoutEntry::new_secondary(1024, 768).unwrap(),
+            MonitorLayoutEntry::new_secondary(1024, 768)
+                .unwrap()
+                .with_position(1280, 0)
+                .unwrap(),
         ];
         let layout = DisplayControlMonitorLayout::new(&monitors).unwrap();
 
@@ -1588,6 +1602,7 @@ mod output_downscaling {
 mod managed_headless_resize {
     use super::*;
     use ironrdp_displaycontrol::pdu::{DisplayControlMonitorLayout, MonitorLayoutEntry};
+    use std::future::Future;
 
     fn single_primary(width: u32, height: u32) -> DisplayControlMonitorLayout {
         DisplayControlMonitorLayout::new(&[MonitorLayoutEntry::new_primary(width, height).unwrap()])
@@ -2170,7 +2185,7 @@ mod managed_headless_resize {
             inner: Arc::clone(&inner),
         };
         {
-            let mut updates = next.updates();
+            let mut updates = Box::pin(next.start_capture_updates());
             std::future::poll_fn(|cx| {
                 assert!(
                     updates.as_mut().poll(cx).is_pending(),
@@ -2185,7 +2200,7 @@ mod managed_headless_resize {
         }
         inner.lock().await.closed = true;
         release_tx.send(()).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(1), next.updates())
+        let result = tokio::time::timeout(Duration::from_secs(1), next.start_capture_updates())
             .await
             .unwrap();
         assert!(result.is_err());
@@ -2199,7 +2214,7 @@ mod managed_headless_resize {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         inner.lock().await.capture_handle =
             Some(std::thread::spawn(move || wait_for_release(release_rx)));
-        let mut updates = display.updates();
+        let mut updates = Box::pin(display.start_capture_updates());
         std::future::poll_fn(|cx| {
             assert!(updates.as_mut().poll(cx).is_pending());
             std::task::Poll::Ready(())
