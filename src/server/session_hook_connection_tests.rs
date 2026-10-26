@@ -5,7 +5,8 @@ use super::*;
 use ironrdp_connector::{ClientConnector, Config, ConnectorResult, Credentials};
 use ironrdp_pdu::{gcc, rdp::capability_sets::MajorPlatformType};
 use ironrdp_server::{
-    DesktopSize, RdpServerDisplay, RdpServerDisplayUpdates, ServerEvent, ServerResult,
+    DesktopSize, DisplayContext, RdpServerDisplay, RdpServerDisplayUpdates, ServerEvent,
+    ServerResult,
 };
 use ironrdp_tokio::{NetworkClient, TokioFramed};
 use std::path::PathBuf;
@@ -38,7 +39,10 @@ impl RdpServerDisplay for IdleDisplay {
         }
     }
 
-    async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
+    async fn updates(
+        &mut self,
+        _ctx: DisplayContext,
+    ) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         Ok(Box::new(Self))
     }
 }
@@ -157,7 +161,7 @@ impl HookServer {
                 .await?;
             let upgraded = ironrdp_tokio::mark_as_upgraded(upgrade, &mut connector);
             let mut framed = TokioFramed::new(stream);
-            ironrdp_tokio::connect_finalize(
+            let outcome = ironrdp_tokio::connect_finalize(
                 upgraded,
                 connector,
                 &mut framed,
@@ -167,6 +171,10 @@ impl HookServer {
                 None,
             )
             .await?;
+            anyhow::ensure!(
+                matches!(outcome, ironrdp_connector::ConnectionOutcome::Connected(_)),
+                "hook regression requires an activated connection, not a redirection"
+            );
             Ok(framed)
         })
         .await
