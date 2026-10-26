@@ -1,4 +1,6 @@
 //! Authentication policy for access to the existing desktop.
+#[cfg(test)]
+mod configured_connection_tests;
 mod pam;
 
 use crate::config::{AuthConfig, ConfigCredentials};
@@ -89,6 +91,29 @@ mod tests {
         assert_eq!(fixed.security, ServerSecurityMode::Hybrid);
         assert!(fixed.credentials.is_some());
         assert!(fixed.validator.is_none());
+    }
+
+    #[test]
+    fn configured_domain_is_passed_through_to_ironrdp() {
+        for domain in [Some("WORKGROUP"), None, Some(" MiXeD \t "), Some("")] {
+            let authentication =
+                PreparedAuthentication::new(AuthConfig::Configured(Some(ConfigCredentials {
+                    username: "user".into(),
+                    domain: domain.map(str::to_owned),
+                    password: "pass".into(),
+                })))
+                .unwrap();
+            assert_eq!(authentication.security, ServerSecurityMode::Hybrid);
+            assert_eq!(
+                authentication.security.connection_policy(),
+                ConnectionPolicy::Preempt
+            );
+            assert!(authentication.validator.is_none());
+            let credentials = authentication.credentials.expect("configured credentials");
+            assert_eq!(credentials.username, "user");
+            assert_eq!(credentials.password, "pass");
+            assert_eq!(credentials.domain.as_deref(), domain);
+        }
     }
 
     #[test]
