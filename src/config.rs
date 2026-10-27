@@ -95,6 +95,10 @@ struct Args {
     #[arg(short, long)]
     username: Option<String>,
 
+    /// Optional NTLM domain for configured RDP authentication
+    #[arg(short, long)]
+    domain: Option<String>,
+
     /// Password for RDP authentication
     #[arg(short, long, conflicts_with = "password_file")]
     password: Option<String>,
@@ -193,6 +197,7 @@ struct ConfigFile {
     cert: Option<String>,
     key: Option<String>,
     username: Option<String>,
+    domain: Option<String>,
     password: Option<String>,
     password_file: Option<String>,
     resolution: Option<String>,
@@ -307,6 +312,7 @@ fn resolve_authentication(args: &mut Args, config: &mut ConfigFile) -> anyhow::R
                 .take()
                 .or(config.username.take())
                 .unwrap_or_default();
+            let domain = args.domain.take().or(config.domain.take());
             let password = resolve_password(
                 args.password.take(),
                 args.password_file.take(),
@@ -314,18 +320,20 @@ fn resolve_authentication(args: &mut Args, config: &mut ConfigFile) -> anyhow::R
                 config.password_file.take(),
             )?;
             Ok(AuthConfig::Configured(ConfigCredentials::from_parts(
-                username, password,
+                username, domain, password,
             )))
         }
         "pam" => {
             anyhow::ensure!(
                 args.username.is_none()
                     && config.username.is_none()
+                    && args.domain.is_none()
+                    && config.domain.is_none()
                     && args.password.is_none()
                     && config.password.is_none()
                     && args.password_file.is_none()
                     && config.password_file.is_none(),
-                "auth-mode pam cannot be combined with username, password or password-file"
+                "auth-mode pam cannot be combined with username, domain, password or password-file"
             );
             let service = service.unwrap_or_else(|| "hypr-rdp".into());
             anyhow::ensure!(
@@ -341,15 +349,20 @@ fn resolve_authentication(args: &mut Args, config: &mut ConfigFile) -> anyhow::R
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ConfigCredentials {
     pub username: String,
+    pub domain: Option<String>,
     pub password: String,
 }
 
 impl ConfigCredentials {
-    fn from_parts(username: String, password: String) -> Option<Self> {
+    fn from_parts(username: String, domain: Option<String>, password: String) -> Option<Self> {
         if username.is_empty() && password.is_empty() {
             None
         } else {
-            Some(Self { username, password })
+            Some(Self {
+                username,
+                domain: domain.filter(|domain| !domain.is_empty()),
+                password,
+            })
         }
     }
 }
@@ -766,19 +779,42 @@ mod tests {
     }
 
     fn warnings(username: &str, password: &str, bind: &str) -> Vec<StartupWarning> {
-        let credentials = ConfigCredentials::from_parts(username.to_owned(), password.to_owned());
+        let credentials =
+            ConfigCredentials::from_parts(username.to_owned(), None, password.to_owned());
         startup_warnings(credentials.as_ref(), parse_bind_addr(bind).unwrap())
     }
 
     #[test]
     fn credential_classification_preserves_every_configured_shape() {
-        assert!(ConfigCredentials::from_parts(String::new(), String::new()).is_none());
+        assert!(ConfigCredentials::from_parts(String::new(), None, String::new()).is_none());
 
         for (username, password) in [("user", "secret"), ("user", ""), ("", "secret")] {
             let credentials =
-                ConfigCredentials::from_parts(username.to_owned(), password.to_owned()).unwrap();
+                ConfigCredentials::from_parts(username.to_owned(), None, password.to_owned())
+                    .unwrap();
             assert_eq!(credentials.username, username);
             assert_eq!(credentials.password, password);
+            assert_eq!(credentials.domain, None);
+        }
+    }
+
+    #[test]
+    fn configured_domain_round_trips_through_from_parts() {
+        for (domain, expected) in [
+            (Some("WORKGROUP"), Some("WORKGROUP")),
+            (Some(" MiXeD \t "), Some(" MiXeD \t ")),
+            (Some(""), None),
+            (None, None),
+        ] {
+            let credentials = ConfigCredentials::from_parts(
+                "user".into(),
+                domain.map(str::to_owned),
+                "pass".into(),
+            )
+            .unwrap();
+            assert_eq!(credentials.username, "user");
+            assert_eq!(credentials.password, "pass");
+            assert_eq!(credentials.domain.as_deref(), expected);
         }
     }
 
@@ -1406,11 +1442,138 @@ mod tests {
 #[cfg(test)]
 mod pam_config_tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn resolve(cli: &[&str], file: &str) -> anyhow::Result<AuthConfig> {
         let mut args = Args::try_parse_from(cli)?;
         let mut config = toml::from_str(file)?;
         resolve_authentication(&mut args, &mut config)
+    }
+
+    #[test]
+    fn cli_domain_does_not_enable_authentication_by_itself() {
+        for option in ["--domain", "-d"] {
+            assert_eq!(
+                resolve(&["hypr-rdp", option, "WORKGROUP"], "").unwrap(),
+                AuthConfig::Configured(None)
+            );
+        }
+    }
+
+    #[test]
+    fn configured_domain_resolves_cli_over_toml_without_changing_credentials() {
+        for (cli, file, expected_domain) in [
+            (
+                &["hypr-rdp"][..],
+                "username = ' Alice '\npassword = ' secret '",
+                None,
+            ),
+            (
+                &["hypr-rdp"][..],
+                "username = ' Alice '\npassword = ' secret '\ndomain = ' File-MiXeD '",
+                Some(" File-MiXeD "),
+            ),
+            (
+                &["hypr-rdp", "--domain", " cLi-MiXeD "][..],
+                "username = ' Alice '\npassword = ' secret '\ndomain = ' File-MiXeD '",
+                Some(" cLi-MiXeD "),
+            ),
+            (
+                &["hypr-rdp", "-d", "Alias"][..],
+                "username = ' Alice '\npassword = ' secret '\ndomain = ' File-MiXeD '",
+                Some("Alias"),
+            ),
+        ] {
+            assert_eq!(
+                resolve(cli, file).unwrap(),
+                AuthConfig::Configured(Some(ConfigCredentials {
+                    username: " Alice ".into(),
+                    domain: expected_domain.map(str::to_owned),
+                    password: " secret ".into(),
+                })),
+                "{cli:?}, {file:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_domain_clears_toml_without_trimming_nonempty_values() {
+        for (cli, domain_config, expected_domain) in [
+            (
+                &["hypr-rdp", "--domain", ""][..],
+                "domain = 'FileDomain'",
+                None,
+            ),
+            (
+                &["hypr-rdp", "--domain="][..],
+                "domain = 'FileDomain'",
+                None,
+            ),
+            (&["hypr-rdp", "-d", ""][..], "domain = 'FileDomain'", None),
+            (&["hypr-rdp"][..], "domain = ''", None),
+            (
+                &["hypr-rdp", "--domain", " \t "][..],
+                "domain = 'FileDomain'",
+                Some(" \t "),
+            ),
+            (&["hypr-rdp"][..], "domain = '   '", Some("   ")),
+        ] {
+            let file = format!("username = 'alice'\npassword = 'secret'\n{domain_config}");
+            assert_eq!(
+                resolve(cli, &file).unwrap(),
+                AuthConfig::Configured(Some(ConfigCredentials {
+                    username: "alice".into(),
+                    domain: expected_domain.map(str::to_owned),
+                    password: "secret".into(),
+                })),
+                "{cli:?}, {file:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_domain_preserves_existing_credential_classification() {
+        assert_eq!(
+            resolve(&["hypr-rdp"], "domain = 'WORKGROUP'").unwrap(),
+            AuthConfig::Configured(None)
+        );
+        for (username, password, enabled) in [
+            ("", "", false),
+            ("user", "", true),
+            ("", "secret", true),
+            (" User ", " secret ", true),
+            ("DOMAIN\\User", "secret", true),
+            ("User@example.org", "secret", true),
+            (" ", " ", true),
+        ] {
+            for (cli_domain, file, expected_domain) in [
+                (&["hypr-rdp"][..], "", None),
+                (
+                    &["hypr-rdp", "--domain", "WORKGROUP"][..],
+                    "",
+                    Some("WORKGROUP"),
+                ),
+                (&["hypr-rdp"][..], "domain = 'MiXeD'", Some("MiXeD")),
+                (
+                    &["hypr-rdp", "--domain", ""][..],
+                    "domain = 'FileDomain'",
+                    None,
+                ),
+            ] {
+                let mut cli = cli_domain.to_vec();
+                cli.extend(["-u", username, "-p", password]);
+                let expected = if enabled {
+                    AuthConfig::Configured(Some(ConfigCredentials {
+                        username: username.into(),
+                        domain: expected_domain.map(str::to_owned),
+                        password: password.into(),
+                    }))
+                } else {
+                    AuthConfig::Configured(None)
+                };
+                assert_eq!(resolve(&cli, file).unwrap(), expected, "{cli:?}, {file:?}");
+            }
+        }
     }
 
     #[test]
@@ -1475,6 +1638,102 @@ mod pam_config_tests {
     }
 
     #[test]
+    fn pam_rejects_domain_presence_in_either_source_even_when_empty() {
+        for domain in ["", "WORKGROUP"] {
+            for (cli, file) in [
+                (
+                    vec!["hypr-rdp", "--auth-mode", "pam", "--domain", domain],
+                    String::new(),
+                ),
+                (
+                    vec!["hypr-rdp", "--auth-mode", "pam"],
+                    format!("domain = '{domain}'"),
+                ),
+                (
+                    vec!["hypr-rdp", "--domain", domain],
+                    "auth_mode = 'pam'".into(),
+                ),
+                (
+                    vec!["hypr-rdp"],
+                    format!("auth_mode = 'pam'\ndomain = '{domain}'"),
+                ),
+                (
+                    vec!["hypr-rdp", "--auth-mode", "pam", "--domain", ""],
+                    format!("domain = '{domain}'"),
+                ),
+            ] {
+                let error = resolve(&cli, &file)
+                    .expect_err("PAM must reject a configured domain before normalization");
+                assert!(format!("{error:#}").contains("domain"), "{cli:?}, {file:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn configured_domain_preserves_password_source_precedence() {
+        use std::io::Write as _;
+
+        let path = std::env::temp_dir().join(format!(
+            "hypr-rdp-domain-password-precedence-{}.txt",
+            std::process::id()
+        ));
+        let mut password_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        password_file.write_all(b" file Secret \r\n").unwrap();
+        drop(password_file);
+        let password_path = path.to_str().unwrap();
+        let config_password_file = format!(
+            "password_file = {}",
+            toml::Value::String(password_path.into())
+        );
+        for (cli, file, expected_domain, expected_password) in [
+            (
+                vec!["hypr-rdp", "--domain", "Cli", "-p", " cli "],
+                "username = 'alice'\ndomain = 'File'\npassword_file = '/nonexistent/domain-test-secret'".into(),
+                "Cli",
+                " cli ",
+            ),
+            (
+                vec!["hypr-rdp", "--password-file", password_path],
+                "username = 'alice'\ndomain = 'File'\npassword = 'config'".into(),
+                "File",
+                " file Secret ",
+            ),
+            (
+                vec!["hypr-rdp", "--domain", "Cli"],
+                format!("username = 'alice'\ndomain = 'File'\n{config_password_file}"),
+                "Cli",
+                " file Secret ",
+            ),
+            (
+                vec!["hypr-rdp", "-p", ""],
+                "username = 'alice'\ndomain = 'File'\npassword = 'config'".into(),
+                "File",
+                "",
+            ),
+        ] {
+            assert_eq!(
+                resolve(&cli, &file).unwrap(),
+                AuthConfig::Configured(Some(ConfigCredentials {
+                    username: "alice".into(),
+                    domain: Some(expected_domain.into()),
+                    password: expected_password.into(),
+                })),
+                "{cli:?}, {file:?}"
+            );
+        }
+        assert!(resolve(
+            &["hypr-rdp", "--domain", "Cli", "-p", "cli"],
+            &format!("username = 'alice'\npassword = 'config'\n{config_password_file}")
+        )
+        .is_err());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn configured_mode_override_preserves_existing_password_precedence() {
         let actual = resolve(
             &["hypr-rdp", "--auth-mode", "configured", "-p", "cli"],
@@ -1485,8 +1744,51 @@ mod pam_config_tests {
             actual,
             AuthConfig::Configured(Some(ConfigCredentials {
                 username: "alice".into(),
+                domain: None,
                 password: "cli".into()
             }))
         );
+    }
+
+    proptest! {
+        #[test]
+        fn generated_configured_domain_precedence_preserves_optional_sources(
+            nonempty_domain in "[A-Za-z0-9éΩ _@.-]{1,32}",
+            file_domain in prop::option::of("[A-Za-z0-9éΩ _@.-]{0,32}"),
+        ) {
+            let mut file = "username = 'alice'\npassword = 'secret'".to_owned();
+            if let Some(domain) = file_domain {
+                file.push_str(&format!("\ndomain = {}", toml::Value::String(domain)));
+            }
+            let cli_option = format!("--domain={nonempty_domain}");
+            prop_assert_eq!(
+                resolve(&["hypr-rdp", &cli_option], &file).unwrap(),
+                AuthConfig::Configured(Some(ConfigCredentials {
+                    username: "alice".into(),
+                    domain: Some(nonempty_domain.clone()),
+                    password: "secret".into(),
+                }))
+            );
+            prop_assert_eq!(
+                resolve(&["hypr-rdp", "--domain="], &file).unwrap(),
+                AuthConfig::Configured(Some(ConfigCredentials {
+                    username: "alice".into(),
+                    domain: None,
+                    password: "secret".into(),
+                }))
+            );
+            let file = format!(
+                "username = 'alice'\npassword = 'secret'\ndomain = {}",
+                toml::Value::String(nonempty_domain.clone())
+            );
+            prop_assert_eq!(
+                resolve(&["hypr-rdp"], &file).unwrap(),
+                AuthConfig::Configured(Some(ConfigCredentials {
+                    username: "alice".into(),
+                    domain: Some(nonempty_domain),
+                    password: "secret".into(),
+                }))
+            );
+        }
     }
 }
