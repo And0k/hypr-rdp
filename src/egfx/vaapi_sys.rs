@@ -63,6 +63,7 @@ pub(crate) const VA_PICTURE_H264_SHORT_TERM_REFERENCE: u32 =
 pub(crate) const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME: u32 = 0x2000_0000;
 pub(crate) const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: u32 = 0x4000_0000;
 pub(crate) const VA_SURFACE_EXTBUF_DESC_ENABLE_TILING: u32 = 0x0000_0008;
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 pub(crate) const VA_EXPORT_SURFACE_READ_ONLY: u32 = va::VA_EXPORT_SURFACE_READ_ONLY;
 pub(crate) const VA_EXPORT_SURFACE_COMPOSED_LAYERS: u32 = va::VA_EXPORT_SURFACE_COMPOSED_LAYERS;
 
@@ -90,6 +91,41 @@ pub(crate) fn va_check(status: VAStatus, op: &str) -> Result<()> {
 /// yields an empty mask; both mean the caller must use legacy `DRM_PRIME`.
 pub(crate) fn prime2_import_supported(memory_types: u32) -> bool {
     memory_types & VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 != 0
+}
+
+/// Legacy `DRM_PRIME` descriptor for the NV12 encoder input, built from the
+/// same layers as the `PRIME_2` descriptor. The UV offset is passed through
+/// unchanged: i965 needs the driver-reported (tile-padded) value.
+/// `buffer` must outlive the `vaCreateSurfaces` call that consumes it.
+fn legacy_nv12_surface_descriptor(
+    buffer: &mut usize,
+    width: u32,
+    height: u32,
+    desc: &VADRMPRIMESurfaceDescriptor,
+) -> VASurfaceAttribExternalBuffers {
+    let y_stride = desc.layers[0].pitch[0];
+    let y_offset = desc.layers[0].offset[0];
+    let uv_stride = desc.layers[1].pitch[0];
+    let uv_offset = desc.layers[1].offset[0];
+
+    let mut legacy: VASurfaceAttribExternalBuffers = unsafe { mem::zeroed() };
+    legacy.pixel_format = fourcc(b"NV12");
+    legacy.width = width;
+    legacy.height = height;
+    legacy.num_planes = 2;
+    legacy.pitches[0] = y_stride;
+    legacy.pitches[1] = uv_stride;
+    legacy.offsets[0] = y_offset;
+    legacy.offsets[1] = uv_offset;
+    legacy.data_size = (y_offset + height * y_stride).max(uv_offset + (height / 2) * uv_stride);
+    legacy.buffers = buffer as *mut usize;
+    legacy.num_buffers = 1;
+    legacy.flags = if desc.objects[0].drm_format_modifier == DRM_FORMAT_MOD_LINEAR {
+        0
+    } else {
+        VA_SURFACE_EXTBUF_DESC_ENABLE_TILING.into()
+    };
+    legacy
 }
 
 pub(crate) struct VaDisplay {
@@ -369,38 +405,71 @@ impl VaDisplay {
 
     pub(crate) fn import_prime_surface(
         self: &Rc<Self>,
+        config_id: VAConfigID,
         rt_format: u32,
         width: u32,
         height: u32,
         desc: &mut VADRMPRIMESurfaceDescriptor,
     ) -> Result<VaSurface> {
-        let mut attrs = [
-            integer_surface_attr(
-                va::VASurfaceAttribType_VASurfaceAttribMemoryType,
-                VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 as i32,
-            ),
-            pointer_surface_attr(
-                va::VASurfaceAttribType_VASurfaceAttribExternalBufferDescriptor,
-                desc as *mut _ as *mut c_void,
-            ),
-        ];
-
         let mut id = 0 as VASurfaceID;
-        va_check(
-            unsafe {
-                va::vaCreateSurfaces(
-                    self.raw,
-                    rt_format,
-                    width,
-                    height,
-                    &mut id,
-                    1,
-                    attrs.as_mut_ptr(),
-                    attrs.len() as u32,
-                )
-            },
-            "vaCreateSurfaces (DMA-BUF import)",
-        )?;
+
+        if self.supports_prime2_import(config_id) {
+            let mut attrs = [
+                integer_surface_attr(
+                    va::VASurfaceAttribType_VASurfaceAttribMemoryType,
+                    VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 as i32,
+                ),
+                pointer_surface_attr(
+                    va::VASurfaceAttribType_VASurfaceAttribExternalBufferDescriptor,
+                    desc as *mut _ as *mut c_void,
+                ),
+            ];
+
+            va_check(
+                unsafe {
+                    va::vaCreateSurfaces(
+                        self.raw,
+                        rt_format,
+                        width,
+                        height,
+                        &mut id,
+                        1,
+                        attrs.as_mut_ptr(),
+                        attrs.len() as u32,
+                    )
+                },
+                "vaCreateSurfaces (DMA-BUF import)",
+            )?;
+        } else {
+            let mut buffer = desc.objects[0].fd as usize;
+            let mut legacy = legacy_nv12_surface_descriptor(&mut buffer, width, height, desc);
+            let mut attrs = [
+                integer_surface_attr(
+                    va::VASurfaceAttribType_VASurfaceAttribMemoryType,
+                    VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME as i32,
+                ),
+                pointer_surface_attr(
+                    va::VASurfaceAttribType_VASurfaceAttribExternalBufferDescriptor,
+                    &mut legacy as *mut _ as *mut c_void,
+                ),
+            ];
+
+            va_check(
+                unsafe {
+                    va::vaCreateSurfaces(
+                        self.raw,
+                        rt_format,
+                        width,
+                        height,
+                        &mut id,
+                        1,
+                        attrs.as_mut_ptr(),
+                        attrs.len() as u32,
+                    )
+                },
+                "vaCreateSurfaces (legacy DMA-BUF import)",
+            )?;
+        }
 
         Ok(VaSurface {
             display: Rc::clone(self),
@@ -837,6 +906,75 @@ mod tests {
     #[test]
     fn empty_memory_type_mask_selects_the_legacy_path() {
         assert!(!prime2_import_supported(0));
+    }
+
+    fn nv12_prime_desc(fd: i32, modifier: u64) -> VADRMPRIMESurfaceDescriptor {
+        let mut desc: VADRMPRIMESurfaceDescriptor = unsafe { mem::zeroed() };
+        desc.fourcc = fourcc(b"NV12");
+        desc.width = 1920;
+        desc.height = 1080;
+        desc.num_objects = 1;
+        desc.objects[0].fd = fd;
+        desc.objects[0].drm_format_modifier = modifier;
+        desc.num_layers = 2;
+        desc.layers[0].drm_format = fourcc(b"NV12");
+        desc.layers[0].num_planes = 1;
+        desc.layers[0].pitch[0] = 1920;
+        desc.layers[0].offset[0] = 0;
+        desc.layers[1].drm_format = fourcc(b"NV12");
+        desc.layers[1].num_planes = 1;
+        desc.layers[1].pitch[0] = 1920;
+        // Tile-padded Y plane size as i965 reports it, not stride * height / 2.
+        desc.layers[1].offset[0] = 1920 * 1088;
+        desc
+    }
+
+    #[test]
+    fn legacy_nv12_descriptor_keeps_the_driver_reported_uv_offset() {
+        let prime2 = nv12_prime_desc(7, DRM_FORMAT_MOD_LINEAR);
+        let mut buffer = 7usize;
+        let legacy = legacy_nv12_surface_descriptor(&mut buffer, 1920, 1080, &prime2);
+
+        assert_eq!(legacy.pixel_format, fourcc(b"NV12"));
+        assert_eq!(legacy.width, 1920);
+        assert_eq!(legacy.height, 1080);
+        assert_eq!(legacy.num_planes, 2);
+        assert_eq!(legacy.pitches[0], 1920);
+        assert_eq!(legacy.pitches[1], 1920);
+        assert_eq!(legacy.offsets[0], 0);
+        assert_eq!(legacy.offsets[1], 1920 * 1088);
+        assert_eq!(legacy.num_buffers, 1);
+        assert_eq!(unsafe { *legacy.buffers }, 7);
+    }
+
+    #[test]
+    fn legacy_nv12_descriptor_data_size_covers_both_planes() {
+        let mut prime2 = nv12_prime_desc(3, DRM_FORMAT_MOD_LINEAR);
+        let mut buffer = 3usize;
+
+        prime2.layers[1].offset[0] = 0;
+        let legacy = legacy_nv12_surface_descriptor(&mut buffer, 1920, 1080, &prime2);
+        assert_eq!(legacy.data_size, 1080 * 1920);
+
+        prime2.layers[1].offset[0] = 1920 * 1088;
+        let legacy = legacy_nv12_surface_descriptor(&mut buffer, 1920, 1080, &prime2);
+        assert_eq!(legacy.data_size, 1920 * 1088 + 540 * 1920);
+    }
+
+    #[test]
+    fn legacy_nv12_descriptor_tiles_only_for_tiled_modifiers() {
+        let linear = nv12_prime_desc(3, DRM_FORMAT_MOD_LINEAR);
+        let mut buffer = 3usize;
+        assert_eq!(
+            legacy_nv12_surface_descriptor(&mut buffer, 1920, 1080, &linear).flags,
+            0
+        );
+
+        let tiled = nv12_prime_desc(3, 0x0100_0000_0000_0001);
+        assert_eq!(
+            legacy_nv12_surface_descriptor(&mut buffer, 1920, 1080, &tiled).flags as u32,
+            VA_SURFACE_EXTBUF_DESC_ENABLE_TILING
+        );
     }
 
     #[test]
