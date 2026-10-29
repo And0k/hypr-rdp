@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{c_void, CStr};
 use std::mem;
 use std::os::unix::io::{AsRawFd, OwnedFd};
@@ -9,7 +11,8 @@ use libva_sys::va_display_drm as va;
 
 pub(crate) use va::{
     VABufferID, VAConfigAttrib, VAConfigID, VAContextID, VADisplay, VAEntrypoint, VAImage,
-    VAImageFormat, VAProfile, VAStatus, VASurfaceAttrib, VASurfaceID,
+    VAImageFormat, VAProfile, VAStatus, VASurfaceAttrib, VASurfaceAttribExternalBuffers,
+    VASurfaceID,
 };
 
 #[repr(C)]
@@ -57,7 +60,9 @@ pub(crate) const VA_CONFIG_ATTRIB_RATE_CONTROL: u32 =
 pub(crate) const VA_PICTURE_H264_INVALID: u32 = va::VA_PICTURE_H264_INVALID;
 pub(crate) const VA_PICTURE_H264_SHORT_TERM_REFERENCE: u32 =
     va::VA_PICTURE_H264_SHORT_TERM_REFERENCE;
+pub(crate) const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME: u32 = 0x2000_0000;
 pub(crate) const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: u32 = 0x4000_0000;
+pub(crate) const VA_SURFACE_EXTBUF_DESC_ENABLE_TILING: u32 = 0x0000_0008;
 pub(crate) const VA_EXPORT_SURFACE_READ_ONLY: u32 = va::VA_EXPORT_SURFACE_READ_ONLY;
 pub(crate) const VA_EXPORT_SURFACE_COMPOSED_LAYERS: u32 = va::VA_EXPORT_SURFACE_COMPOSED_LAYERS;
 
@@ -79,9 +84,18 @@ pub(crate) fn va_check(status: VAStatus, op: &str) -> Result<()> {
     }
 }
 
+/// Whether a `VASurfaceAttribMemoryType` bitmask advertises `DRM_PRIME_2`
+/// import. Drivers that predate `PRIME_2` (i965) report only the legacy
+/// `DRM_PRIME` bit, and a driver that reports no memory-type attribute at all
+/// yields an empty mask; both mean the caller must use legacy `DRM_PRIME`.
+pub(crate) fn prime2_import_supported(memory_types: u32) -> bool {
+    memory_types & VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 != 0
+}
+
 pub(crate) struct VaDisplay {
     raw: VADisplay,
     _fd: OwnedFd,
+    surface_memory_types_cache: RefCell<HashMap<VAConfigID, Option<u32>>>,
 }
 
 struct PendingVaDisplay(VADisplay);
@@ -127,7 +141,66 @@ impl VaDisplay {
         Ok(Rc::new(Self {
             raw: pending.into_raw(),
             _fd: fd,
+            surface_memory_types_cache: RefCell::new(HashMap::new()),
         }))
+    }
+
+    /// Memory-type bitmask that the driver advertises for a config, or `None`
+    /// when it refuses the query. Cached per config id: the capture path asks
+    /// on every start-up, never per frame.
+    pub(crate) fn surface_memory_types(&self, config_id: VAConfigID) -> Option<u32> {
+        if let Some(cached) = self.surface_memory_types_cache.borrow().get(&config_id) {
+            return *cached;
+        }
+        let queried = self.query_surface_memory_types(config_id);
+        self.surface_memory_types_cache
+            .borrow_mut()
+            .insert(config_id, queried);
+        queried
+    }
+
+    /// Whether `DRM_PRIME_2` surfaces can be imported for this config.
+    ///
+    /// A failed query keeps the pre-existing behaviour (`PRIME_2`), while a
+    /// successful query without the `PRIME_2` bit — including one that reports
+    /// no memory-type attribute — selects the legacy `DRM_PRIME` path.
+    pub(crate) fn supports_prime2_import(&self, config_id: VAConfigID) -> bool {
+        self.surface_memory_types(config_id)
+            .is_none_or(prime2_import_supported)
+    }
+
+    /// i965 treats `*num_attribs` as the capacity of the caller's buffer and
+    /// fills in the written count, so a zero capacity fails with
+    /// `MAX_NUM_EXCEEDED` and leaves the list untouched.
+    fn query_surface_memory_types(&self, config_id: VAConfigID) -> Option<u32> {
+        const ATTRIB_CAPACITY: usize = 64;
+
+        let mut attribs: Vec<VASurfaceAttrib> = (0..ATTRIB_CAPACITY)
+            .map(|_| unsafe { mem::zeroed() })
+            .collect();
+        let mut count = ATTRIB_CAPACITY as u32;
+        let status = unsafe {
+            va::vaQuerySurfaceAttributes(
+                self.raw,
+                config_id,
+                attribs.as_mut_ptr(),
+                &mut count,
+            )
+        };
+        if let Err(error) = va_check(status, "vaQuerySurfaceAttributes") {
+            tracing::debug!(
+                config_id,
+                %error,
+                "Surface attribute query failed; assuming PRIME_2 import"
+            );
+            return None;
+        }
+
+        attribs
+            .iter()
+            .take((count as usize).min(ATTRIB_CAPACITY))
+            .find(|attrib| attrib.type_ == va::VASurfaceAttribType_VASurfaceAttribMemoryType)
+            .map(|attrib| unsafe { attrib.value.value.i as u32 })
     }
 
     pub(super) fn raw(&self) -> VADisplay {
@@ -382,7 +455,7 @@ impl Drop for VaDisplay {
 
 pub(crate) struct VaConfig {
     display: Rc<VaDisplay>,
-    id: u32,
+    pub(crate) id: u32,
 }
 
 impl Drop for VaConfig {
@@ -717,7 +790,7 @@ struct MiscEncParamBuffer<T> {
     value: T,
 }
 
-fn integer_surface_attr(type_: u32, value: i32) -> VASurfaceAttrib {
+pub(crate) fn integer_surface_attr(type_: u32, value: i32) -> VASurfaceAttrib {
     let mut attr: VASurfaceAttrib = unsafe { mem::zeroed() };
     attr.type_ = type_;
     attr.flags = va::VA_SURFACE_ATTRIB_SETTABLE;
@@ -726,7 +799,7 @@ fn integer_surface_attr(type_: u32, value: i32) -> VASurfaceAttrib {
     attr
 }
 
-fn pointer_surface_attr(type_: u32, value: *mut c_void) -> VASurfaceAttrib {
+pub(crate) fn pointer_surface_attr(type_: u32, value: *mut c_void) -> VASurfaceAttrib {
     let mut attr: VASurfaceAttrib = unsafe { mem::zeroed() };
     attr.type_ = type_;
     attr.flags = va::VA_SURFACE_ATTRIB_SETTABLE;
@@ -744,6 +817,26 @@ mod tests {
         segment.buf = bytes.as_mut_ptr().cast();
         segment.size = bytes.len() as u32;
         segment
+    }
+
+    #[test]
+    fn prime2_import_is_detected_from_the_memory_type_mask() {
+        // VA | DRM_PRIME_2, as a modern driver advertises.
+        assert!(prime2_import_supported(0x4000_0001));
+    }
+
+    #[test]
+    fn legacy_prime_mask_selects_the_legacy_path() {
+        // Measured i965 2.4.5: VA | KERNEL_DRM | DRM_PRIME, no PRIME_2 bit.
+        assert!(!prime2_import_supported(0x3000_0001));
+        assert!(!prime2_import_supported(
+            VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME
+        ));
+    }
+
+    #[test]
+    fn empty_memory_type_mask_selects_the_legacy_path() {
+        assert!(!prime2_import_supported(0));
     }
 
     #[test]
