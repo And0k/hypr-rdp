@@ -457,8 +457,9 @@ impl VppConverter {
                 unsafe { va::vaEndPicture(self.va_display.raw(), self.context_id) },
                 "vaEndPicture (VPP)",
             )?;
-            va_check(
-                unsafe { va::vaSyncSurface(self.va_display.raw(), self.output_surface) },
+            sys::va_sync_surface(
+                self.va_display.raw(),
+                self.output_surface,
                 "vaSyncSurface (VPP output)",
             )?;
             Ok(())
@@ -469,6 +470,18 @@ impl VppConverter {
         }
 
         result
+    }
+
+    /// Memory-type mask and import path this converter chose, for the failure
+    /// record. Served from the display's per-config cache, never per frame.
+    pub(crate) fn import_evidence(&self) -> (Option<u32>, &'static str) {
+        let memory_types = self.va_display.surface_memory_types(self.config_id);
+        let import_path = if self.prime2_import {
+            "DRM_PRIME_2"
+        } else {
+            "DRM_PRIME (legacy)"
+        };
+        (memory_types, import_path)
     }
 
     /// Get the number of imported input surfaces.

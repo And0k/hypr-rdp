@@ -1,10 +1,12 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr};
+use std::fmt;
 use std::mem;
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::path::Path;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use libva_sys::va_display_drm as va;
@@ -82,6 +84,103 @@ pub(crate) fn va_check(status: VAStatus, op: &str) -> Result<()> {
         Ok(())
     } else {
         bail!("{} failed with VA status {}", op, status);
+    }
+}
+
+/// Deadline for one GPU surface-completion wait.
+///
+/// A healthy 1080p VPP conversion or H.264 encode finishes in single-digit
+/// milliseconds, so 2000 ms is roughly a hundred frames of headroom: a wait
+/// that reaches it is a hung driver, not a slow frame. The blocking
+/// `vaSyncSurface` this replaced had no bound at all and once stalled a live
+/// session for 90 minutes without writing a single log line.
+const GPU_SURFACE_SYNC_TIMEOUT: Duration = Duration::from_millis(2_000);
+
+/// Pause between `vaQuerySurfaceStatus` polls. Short enough to stay inside a
+/// frame interval, long enough not to burn a core while the GPU works.
+const GPU_SURFACE_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+const VA_SURFACE_READY: u32 = va::VASurfaceStatus_VASurfaceReady;
+
+/// A GPU surface that never reported completion before its deadline.
+#[derive(Debug)]
+pub(crate) struct SurfaceSyncTimeout {
+    operation: &'static str,
+    surface: VASurfaceID,
+    status: u32,
+}
+
+impl SurfaceSyncTimeout {
+    pub(crate) fn operation(&self) -> &'static str {
+        self.operation
+    }
+
+    pub(crate) fn surface(&self) -> VASurfaceID {
+        self.surface
+    }
+
+    pub(crate) fn status(&self) -> u32 {
+        self.status
+    }
+}
+
+impl fmt::Display for SurfaceSyncTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} on surface {} did not complete within {} ms (last VA status {})",
+            self.operation,
+            self.surface,
+            GPU_SURFACE_SYNC_TIMEOUT.as_millis(),
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for SurfaceSyncTimeout {}
+
+/// Whether `now` has reached `deadline`.
+fn sync_deadline_passed(deadline: Instant, now: Instant) -> bool {
+    now >= deadline
+}
+
+/// Whether a `vaQuerySurfaceStatus` result means the surface is done.
+fn surface_status_complete(status: u32) -> bool {
+    status & VA_SURFACE_READY != 0
+}
+
+/// Wait for `surface` to finish, bounded by [`GPU_SURFACE_SYNC_TIMEOUT`].
+///
+/// `vaSyncSurface` blocks inside the driver, where no timeout can interrupt
+/// it; `vaQuerySurfaceStatus` can be polled. The healthy path returns after a
+/// single query and writes nothing to the log.
+pub(crate) fn va_sync_surface(
+    display: VADisplay,
+    surface: VASurfaceID,
+    operation: &'static str,
+) -> Result<()> {
+    let deadline = Instant::now() + GPU_SURFACE_SYNC_TIMEOUT;
+    loop {
+        let mut status: u32 = 0;
+        va_check(
+            unsafe { va::vaQuerySurfaceStatus(display, surface, &mut status) },
+            "vaQuerySurfaceStatus",
+        )?;
+
+        if surface_status_complete(status) {
+            return Ok(());
+        }
+
+        if sync_deadline_passed(deadline, Instant::now()) {
+            return Err(SurfaceSyncTimeout {
+                operation,
+                surface,
+                status,
+            }
+            .into());
+        }
+
+        std::thread::sleep(GPU_SURFACE_SYNC_POLL_INTERVAL);
     }
 }
 
@@ -638,10 +737,7 @@ impl VaContext {
         );
         render_result?;
         end_result?;
-        va_check(
-            unsafe { va::vaSyncSurface(self.display.raw, surface) },
-            "vaSyncSurface",
-        )
+        va_sync_surface(self.display.raw, surface, "vaSyncSurface (encoder)")
     }
 }
 
@@ -975,6 +1071,36 @@ mod tests {
             legacy_nv12_surface_descriptor(&mut buffer, 1920, 1080, &tiled).flags as u32,
             VA_SURFACE_EXTBUF_DESC_ENABLE_TILING
         );
+    }
+
+    #[test]
+    fn sync_deadline_is_not_expired_before_its_instant() {
+        let deadline = Instant::now() + GPU_SURFACE_SYNC_TIMEOUT;
+
+        assert!(!sync_deadline_passed(deadline, Instant::now()));
+    }
+
+    #[test]
+    fn sync_deadline_is_expired_at_and_after_its_instant() {
+        let deadline = Instant::now() + GPU_SURFACE_SYNC_TIMEOUT;
+
+        assert!(sync_deadline_passed(deadline, deadline));
+        assert!(sync_deadline_passed(
+            deadline,
+            deadline + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn surface_status_ready_completes_the_wait() {
+        assert!(surface_status_complete(va::VASurfaceStatus_VASurfaceReady));
+        assert!(surface_status_complete(
+            va::VASurfaceStatus_VASurfaceReady | va::VASurfaceStatus_VASurfaceDisplaying
+        ));
+        assert!(!surface_status_complete(
+            va::VASurfaceStatus_VASurfaceRendering
+        ));
+        assert!(!surface_status_complete(0));
     }
 
     #[test]
